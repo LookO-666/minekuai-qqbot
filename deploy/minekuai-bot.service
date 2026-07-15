@@ -1,0 +1,46 @@
+# 麦块联机 QQ Bot - systemd 服务
+#
+# 仅在不使用 Docker 时需要这个文件。
+# Docker 部署见 docs/DEPLOY-LINUX.md（推荐）
+#
+# 使用方法:
+#   1. 修改下面的 User、WorkingDirectory、ExecStart 三个字段为你的实际路径
+#   2. sudo cp minekuai-bot.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now minekuai-bot
+#
+# 查看状态: sudo systemctl status minekuai-bot
+# 查看日志: sudo journalctl -u minekuai-bot -f
+# 重启:    sudo systemctl restart minekuai-bot
+
+[Unit]
+Description=Minekuai QQ Bot
+Documentation=https://github.com/your-repo/minekuai-qqbot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+
+WorkingDirectory=/home/ubuntu/minekuai-qqbot/bot
+ExecStart=/home/ubuntu/minekuai-qqbot/bot/.venv/bin/python bot.py
+
+# 异常时自动重启，但限制重启频率防止崩溃循环
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# 日志输出到 journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=minekuai-bot
+
+# 资源限制（防止机器人异常吃光资源）
+MemoryMax=512M
+TasksMax=200
+
+[Install]
+WantedBy=multi-user.target

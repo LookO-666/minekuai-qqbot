@@ -1,0 +1,31 @@
+services:
+  napcat:
+    image: docker.io/mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: unless-stopped
+    network_mode: host
+    entrypoint:
+    - /bin/bash
+    - -c
+    - mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix && sed -i 's/:1/:99/g;
+      s/X1-lock/X99-lock/g' /app/entrypoint.sh && exec /app/entrypoint.sh
+    environment:
+    - NAPCAT_UID=1000
+    - NAPCAT_GID=1000
+    - WEBUI_PORT=6099
+    volumes:
+    - ./napcat-data/QQ:/app/.config/QQ
+    - ./napcat-data/config:/app/napcat/config
+  bot:
+    build: ./bot
+    container_name: minekuai-bot
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+    - napcat
+    env_file:
+    - ./bot/.env
+    environment:
+    - OPERATION_LOG_DB=/app/data/operation_log.db
+    volumes:
+    - ./bot-data:/app/data
