@@ -45,13 +45,16 @@ def is_admin_allowed(
     allowed_groups: Iterable[int],
     allowed_users: Iterable[int],
     admin_users: Iterable[int],
+    admin_all_group_members: bool = False,
 ) -> tuple[bool, str]:
-    """先执行普通权限校验，再要求用户位于管理员名单中。"""
+    """先执行普通权限校验，再检查全员管理员开关或管理员名单。"""
     ok, reason = is_user_allowed(
         user_id, group_id, allowed_groups, allowed_users
     )
     if not ok:
         return ok, reason
+    if admin_all_group_members and group_id is not None:
+        return True, ""
     admins = set(admin_users)
     if not admins:
         return False, "机器人尚未配置管理员，请在 .env 设置 ADMIN_USERS"

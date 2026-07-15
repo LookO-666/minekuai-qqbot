@@ -15,6 +15,7 @@ class Config(BaseModel):
     allowed_groups: List[int] = []   # 允许使用的群号（空=不限制）
     allowed_users: List[int] = []    # 允许使用的 QQ 号（空=群里所有人）
     admin_users: List[int] = []      # 管理员 QQ；高权限命令仅这些账号可用
+    admin_all_group_members: bool = False  # 白名单群内所有可用成员均视为管理员
 
     # 行为
     command_cooldown: int = 30       # 同一用户的指令冷却（秒）

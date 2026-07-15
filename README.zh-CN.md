@@ -30,7 +30,7 @@
 
 ## 指令速查
 
-默认无前缀，群里直接发送即可。表格中的 🔒 表示仅 `ADMIN_USERS` 管理员可用；其余指令仍受 `ALLOWED_GROUPS`、`ALLOWED_USERS` 和冷却限制。
+默认无前缀，群里直接发送即可。表格中的 🔒 表示仅 `ADMIN_USERS` 管理员可用；当 `ADMIN_ALL_GROUP_MEMBERS=true` 时，白名单群内所有可用成员也能使用。所有指令仍受 `ALLOWED_GROUPS`、`ALLOWED_USERS` 和冷却限制。
 
 ### 日常开关与查询
 
@@ -218,12 +218,13 @@ nano bot/.env
 |---|---|
 | `ALLOWED_GROUPS` | 你的 QQ 群号列表，如 `[123456789]`（必填） |
 | `ALLOWED_USERS` | 允许的 QQ 号列表，留空 `[]` = 群内所有人都能用 |
-| `ADMIN_USERS` | 管理员 QQ 号列表；留空时管理指令默认拒绝 |
+| `ADMIN_USERS` | 管理员 QQ 号列表；留空时管理指令默认拒绝，除非开启群全员管理权限 |
+| `ADMIN_ALL_GROUP_MEMBERS` | 设为 `true` 后，`ALLOWED_GROUPS` 白名单群内所有可用成员均可执行管理指令；默认 `false`，仅应在可信群开启 |
 | `CREDENTIAL_ENCRYPTION_KEY` | SQLite 敏感凭据加密密钥（必填，生成后妥善备份） |
 | `COMMAND_COOLDOWN` | 同一用户的指令冷却（秒），默认 5 |
 | `STOP_NEED_CONFIRM` | 关服是否需要二次确认，默认 `true` |
 
-> **服务器/账号配置一律不用预先写 `.env`**——bot 启动后由 `ADMIN_USERS` 中的管理员在 QQ 群里发 `添加服务器` / `添加账号` 全交互式完成。
+> **服务器/账号配置一律不用预先写 `.env`**——bot 启动后由 `ADMIN_USERS` 中的管理员操作；若设置 `ADMIN_ALL_GROUP_MEMBERS=true`，白名单群内任意可用成员也可在 QQ 群里发 `添加服务器` / `添加账号` 完成交互式配置。
 >
 > 生成密钥：`python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。密钥丢失后已加密凭据无法恢复，请和数据库备份分开保管。
 
@@ -410,6 +411,7 @@ MINEKUAI_CARD_ID=
 ALLOWED_GROUPS=[群号1, 群号2]              # 哪些群能用，空=不限群（不推荐）
 ALLOWED_USERS=[]                          # 哪些 QQ 能用，空=群内所有人都能用
 ADMIN_USERS=[管理员QQ号]                   # 配置、账号、日志、重启等管理权限
+ADMIN_ALL_GROUP_MEMBERS=false              # true=白名单群内所有可用成员都有管理权限
 CREDENTIAL_ENCRYPTION_KEY=                 # Fernet 密钥；生成后不可随意更换
 
 # ===== 行为 =====
@@ -523,7 +525,8 @@ docker compose --profile test run --rm test
 4. **`bot/.env` 文件权限收紧**：`chmod 600 bot/.env`
 5. **备份加密密钥**：`CREDENTIAL_ENCRYPTION_KEY` 不要提交到 Git，也不要在已有数据时随意更换；密钥丢失将无法解密凭据
 6. **minekuai 密码仍建议独立使用**：数据库已加密，但独立强密码能降低主机或备份泄露后的连带风险
-7. **定期备份 SQLite**：
+7. **开启群全员管理员等于完全信任全体群员**：除非每位成员都可以管理凭据、执行控制台命令以及关停或删除服务器，否则保持 `ADMIN_ALL_GROUP_MEMBERS=false`
+8. **定期备份 SQLite**：
    ```bash
    cp bot-data/operation_log.db bot-data/operation_log.db.$(date +%F).bak
    ```

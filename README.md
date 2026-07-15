@@ -30,7 +30,7 @@ Send `开服` (start server) in a QQ group and the bot will start both the [Mine
 
 ## Command reference
 
-Commands have no prefix by default and can be sent directly in a QQ group. Commands marked 🔒 are limited to users in `ADMIN_USERS`. All other commands are still subject to `ALLOWED_GROUPS`, `ALLOWED_USERS`, and cooldown settings.
+Commands have no prefix by default and can be sent directly in a QQ group. Commands marked 🔒 are limited to users in `ADMIN_USERS`, or to all allowed group members when `ADMIN_ALL_GROUP_MEMBERS=true`. All commands remain subject to `ALLOWED_GROUPS`, `ALLOWED_USERS`, and cooldown settings.
 
 The command names are Chinese because the bot is designed for Chinese QQ groups; English aliases are available for several common operations.
 
@@ -220,12 +220,13 @@ Only the permission-related fields are required initially:
 |---|---|
 | `ALLOWED_GROUPS` | QQ group IDs, for example `[123456789]` (required). |
 | `ALLOWED_USERS` | Allowed QQ user IDs. Leave as `[]` to allow every member of an allowed group. |
-| `ADMIN_USERS` | Administrator QQ user IDs. Administrative commands are denied when empty. |
+| `ADMIN_USERS` | Administrator QQ user IDs. Administrative commands are denied when empty unless group-wide administration is enabled. |
+| `ADMIN_ALL_GROUP_MEMBERS` | Set to `true` to grant administrative commands to every allowed member of an `ALLOWED_GROUPS` group. Defaults to `false`; enable only in a trusted group. |
 | `CREDENTIAL_ENCRYPTION_KEY` | Fernet key used to encrypt sensitive SQLite fields (required; back it up securely). |
 | `COMMAND_COOLDOWN` | Per-user command cooldown in seconds; defaults to 5. |
 | `STOP_NEED_CONFIRM` | Whether stopping a server requires confirmation; defaults to `true`. |
 
-> **Do not preconfigure servers or accounts in `.env`.** After the bot starts, an `ADMIN_USERS` administrator can complete setup interactively with `添加账号` and `添加服务器` in QQ.
+> **Do not preconfigure servers or accounts in `.env`.** After the bot starts, an `ADMIN_USERS` administrator—or any allowed group member when `ADMIN_ALL_GROUP_MEMBERS=true`—can complete setup interactively with `添加账号` and `添加服务器` in QQ.
 >
 > Generate a key with `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Existing encrypted credentials cannot be recovered if the key is lost. Store key and database backups separately.
 
@@ -414,6 +415,7 @@ MINEKUAI_CARD_ID=
 ALLOWED_GROUPS=[group_id_1, group_id_2]   # allowed groups; empty allows all (not recommended)
 ALLOWED_USERS=[]                          # allowed QQ users; empty allows all users in allowed groups
 ADMIN_USERS=[admin_qq_id]                 # server/account/log/restart administration
+ADMIN_ALL_GROUP_MEMBERS=false              # true grants admin rights to all allowed group members
 CREDENTIAL_ENCRYPTION_KEY=                # Fernet key; do not change after data is encrypted
 
 # ===== behavior =====
@@ -529,7 +531,8 @@ docker compose --profile test run --rm test
 4. **Restrict `bot/.env` permissions:** run `chmod 600 bot/.env`.
 5. **Back up `CREDENTIAL_ENCRYPTION_KEY`.** Never commit it, and do not change it after storing encrypted data. Losing it makes credentials unrecoverable.
 6. **Use a unique, strong Minekuai password.** Database encryption reduces exposure but does not eliminate host or backup compromise risks.
-7. **Back up SQLite regularly:**
+7. **Treat group-wide administration as full trust.** Keep `ADMIN_ALL_GROUP_MEMBERS=false` unless every member of every allowed group may manage credentials, run console commands, and stop or delete servers.
+8. **Back up SQLite regularly:**
    ```bash
    cp bot-data/operation_log.db bot-data/operation_log.db.$(date +%F).bak
    ```

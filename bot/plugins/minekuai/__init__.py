@@ -340,6 +340,7 @@ def _check_admin_perm(event: MessageEvent) -> tuple[bool, str]:
     return is_admin_allowed(
         event.user_id, group_id,
         config.allowed_groups, config.allowed_users, config.admin_users,
+        config.admin_all_group_members,
     )
 
 
@@ -3261,10 +3262,15 @@ async def _help(matcher: Matcher, event: MessageEvent):
         "确认关服｜5 分钟内确认刚才的关服请求\n"
         if config.stop_need_confirm else ""
     )
+    admin_scope = (
+        "白名单群内所有成员可用"
+        if config.admin_all_group_members else "仅管理员可用"
+    )
     text = (
         "🎮 麦块联机 QQ Bot｜帮助\n"
         "直接发送指令，不用 @，默认无前缀。\n"
-        "[服务器] 可不填；<内容> 必须填写；🔒 仅管理员。\n"
+        "[服务器] 可不填；<内容> 必须填写。\n"
+        f"🔒 {admin_scope}。\n"
         "多台服务器且未写名字时，Bot 会提示选择。\n"
         "\n"
         "━━ 🚀 开关服与查询 ━━\n"

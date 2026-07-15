@@ -168,3 +168,28 @@ def test_admin_permission_fails_closed_when_unconfigured():
     )
     assert ok is False
     assert "ADMIN_USERS" in reason
+
+
+def test_admin_permission_all_group_members():
+    ok, reason = permission.is_admin_allowed(
+        user_id=111, group_id=12345,
+        allowed_groups=[12345], allowed_users=[], admin_users=[],
+        admin_all_group_members=True,
+    )
+    assert ok is True
+    assert reason == ""
+
+    ok, _reason = permission.is_admin_allowed(
+        user_id=111, group_id=99999,
+        allowed_groups=[12345], allowed_users=[], admin_users=[],
+        admin_all_group_members=True,
+    )
+    assert ok is False
+
+    ok, reason = permission.is_admin_allowed(
+        user_id=111, group_id=None,
+        allowed_groups=[12345], allowed_users=[], admin_users=[],
+        admin_all_group_members=True,
+    )
+    assert ok is False
+    assert "QQ 群" in reason
