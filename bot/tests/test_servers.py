@@ -14,6 +14,9 @@ def servers_mod(tmp_path):
     """每个测试用一个全新的临时 SQLite 文件"""
     db_path = tmp_path / "test.db"
     os.environ["OPERATION_LOG_DB"] = str(db_path)
+    os.environ["CREDENTIAL_ENCRYPTION_KEY"] = (
+        "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+    )
 
     sys.path.insert(0, str(Path(__file__).parent.parent / "plugins" / "minekuai"))
     # 强制重新加载，让模块拿到新的 DB_PATH
@@ -220,3 +223,53 @@ def test_maybe_migrate_skipped_when_env_empty(servers_mod):
     assert servers_mod.get_server("default") is None
     servers_mod.maybe_migrate_from_env("tok", "", "card")
     assert servers_mod.get_server("default") is None
+
+
+def test_sensitive_values_are_encrypted_at_rest(servers_mod):
+    servers_mod.add_account("13900000000", "secret-password")
+    servers_mod.update_account_session(
+        "13900000000", "laravel-cookie", "xsrf-value"
+    )
+    servers_mod.add_server("X", "1", "secret-token", "client-id")
+
+    with servers_mod._connect() as conn:
+        raw_token = conn.execute(
+            "SELECT token FROM servers WHERE name = 'X'"
+        ).fetchone()[0]
+        raw_account = conn.execute(
+            "SELECT password, session_cookie, xsrf_token FROM accounts "
+            "WHERE phone = '13900000000'"
+        ).fetchone()
+
+    assert raw_token.startswith("enc:v1:")
+    assert all(value.startswith("enc:v1:") for value in raw_account)
+    assert servers_mod.get_server("X").token == "secret-token"
+    account = servers_mod.get_account("13900000000")
+    assert account.password == "secret-password"
+    assert account.session_cookie == "laravel-cookie"
+    assert account.xsrf_token == "xsrf-value"
+
+
+def test_plaintext_credentials_migrate_once(servers_mod):
+    now = 1
+    with servers_mod._connect() as conn:
+        conn.execute(
+            "INSERT INTO servers "
+            "(name, card_id, token, client_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy", "1", "plain-token", "cid", now, now),
+        )
+        conn.execute(
+            "INSERT INTO accounts "
+            "(phone, password, session_cookie, xsrf_token, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("13900000000", "plain-pw", "plain-cookie", "plain-xsrf", now, now),
+        )
+        first = servers_mod.migrate_plaintext_credentials(conn)
+        second = servers_mod.migrate_plaintext_credentials(conn)
+        conn.commit()
+
+    assert first == {"server_tokens": 1, "account_secrets": 3}
+    assert second == {"server_tokens": 0, "account_secrets": 0}
+    assert servers_mod.get_server("legacy").token == "plain-token"
+    assert servers_mod.get_account("13900000000").password == "plain-pw"

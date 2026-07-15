@@ -13,6 +13,19 @@ from time import time
 
 from loguru import logger
 
+try:
+    from .credentials import (
+        decrypt_secret,
+        encrypt_secret,
+        migrate_plaintext_credentials,
+    )
+except ImportError:  # 独立加载模块的测试兼容
+    from credentials import (
+        decrypt_secret,
+        encrypt_secret,
+        migrate_plaintext_credentials,
+    )
+
 DB_PATH = Path(os.getenv("OPERATION_LOG_DB", "operation_log.db"))
 
 
@@ -51,6 +64,20 @@ _ACCOUNT_COLS = (
     "phone, password, session_cookie, xsrf_token, "
     "created_at, updated_at, last_refresh_at"
 )
+
+
+def _server_from_row(row) -> Server:
+    values = list(row)
+    values[2] = decrypt_secret(values[2])
+    return Server(*values)
+
+
+def _account_from_row(row) -> Account:
+    values = list(row)
+    values[1] = decrypt_secret(values[1])
+    values[2] = decrypt_secret(values[2])
+    values[3] = decrypt_secret(values[3])
+    return Account(*values)
 
 
 def _connect() -> sqlite3.Connection:
@@ -120,6 +147,13 @@ def init_db() -> None:
                     f"ALTER TABLE accounts ADD COLUMN {col_name} {col_def}"
                 )
                 logger.info(f"已为 accounts 表添加 {col_name} 列（迁移）")
+        migrated = migrate_plaintext_credentials(conn)
+        if any(migrated.values()):
+            logger.info(
+                "敏感凭据迁移完成: "
+                f"server_tokens={migrated['server_tokens']}, "
+                f"account_secrets={migrated['account_secrets']}"
+            )
         # QQ ↔ MC 玩家绑定（一个 QQ 对一个 MC 名，反向唯一）
         conn.execute(
             """
@@ -202,7 +236,7 @@ def list_servers() -> list[Server]:
         rows = conn.execute(
             f"SELECT {_SERVER_COLS} FROM servers ORDER BY name"
         ).fetchall()
-    return [Server(*r) for r in rows]
+    return [_server_from_row(r) for r in rows]
 
 
 def get_server(name: str) -> Server | None:
@@ -211,7 +245,7 @@ def get_server(name: str) -> Server | None:
             f"SELECT {_SERVER_COLS} FROM servers WHERE name = ?",
             (name,),
         ).fetchone()
-    return Server(*row) if row else None
+    return _server_from_row(row) if row else None
 
 
 def add_server(
@@ -233,7 +267,7 @@ def add_server(
                 "created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    name, card_id, token, client_id, address,
+                    name, card_id, encrypt_secret(token), client_id, address,
                     account_phone, instance_uuid, now, now, now,
                 ),
             )
@@ -300,7 +334,7 @@ def list_accounts() -> list[Account]:
         rows = conn.execute(
             f"SELECT {_ACCOUNT_COLS} FROM accounts ORDER BY phone"
         ).fetchall()
-    return [Account(*r) for r in rows]
+    return [_account_from_row(r) for r in rows]
 
 
 def get_account(phone: str) -> Account | None:
@@ -309,7 +343,7 @@ def get_account(phone: str) -> Account | None:
             f"SELECT {_ACCOUNT_COLS} FROM accounts WHERE phone = ?",
             (phone,),
         ).fetchone()
-    return Account(*row) if row else None
+    return _account_from_row(row) if row else None
 
 
 def add_account(phone: str, password: str) -> None:
@@ -320,7 +354,7 @@ def add_account(phone: str, password: str) -> None:
             conn.execute(
                 "INSERT INTO accounts (phone, password, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?)",
-                (phone, password, now, now),
+                (phone, encrypt_secret(password), now, now),
             )
             conn.commit()
     except sqlite3.IntegrityError as e:
@@ -336,7 +370,7 @@ def update_account_session(
         cur = conn.execute(
             "UPDATE accounts SET session_cookie = ?, xsrf_token = ?, "
             "last_refresh_at = ?, updated_at = ? WHERE phone = ?",
-            (session_cookie, xsrf_token, now, now, phone),
+            (encrypt_secret(session_cookie), encrypt_secret(xsrf_token), now, now, phone),
         )
         conn.commit()
     return cur.rowcount > 0
@@ -347,7 +381,7 @@ def update_account_password(phone: str, password: str) -> bool:
     with closing(_connect()) as conn:
         cur = conn.execute(
             "UPDATE accounts SET password = ?, updated_at = ? WHERE phone = ?",
-            (password, now, phone),
+            (encrypt_secret(password), now, phone),
         )
         conn.commit()
     return cur.rowcount > 0
@@ -389,7 +423,7 @@ def update_token(name: str, token: str) -> bool:
     with closing(_connect()) as conn:
         cur = conn.execute(
             "UPDATE servers SET token = ?, updated_at = ? WHERE name = ?",
-            (token, now, name),
+            (encrypt_secret(token), now, name),
         )
         conn.commit()
     return cur.rowcount > 0
@@ -406,10 +440,10 @@ def update_credentials(name: str, token: str, client_id: str = "") -> bool:
             "UPDATE servers SET token = ?, client_id = ?, updated_at = ? "
             "WHERE name = ?"
         )
-        params = (token, client_id, now, name)
+        params = (encrypt_secret(token), client_id, now, name)
     else:
         sql = "UPDATE servers SET token = ?, updated_at = ? WHERE name = ?"
-        params = (token, now, name)
+        params = (encrypt_secret(token), now, name)
     with closing(_connect()) as conn:
         cur = conn.execute(sql, params)
         conn.commit()

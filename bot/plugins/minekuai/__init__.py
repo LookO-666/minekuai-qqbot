@@ -88,6 +88,7 @@ from .config import Config
 from .permission import (
     check_cooldown,
     consume_pending_confirm,
+    is_admin_allowed,
     is_user_allowed,
     mark_pending_confirm,
     update_cooldown,
@@ -330,6 +331,15 @@ def _check_perm(event: MessageEvent) -> tuple[bool, str]:
     return is_user_allowed(
         user_id, group_id,
         config.allowed_groups, config.allowed_users,
+    )
+
+
+def _check_admin_perm(event: MessageEvent) -> tuple[bool, str]:
+    """管理员权限校验；普通群权限仍由 _check_perm 统一处理。"""
+    group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
+    return is_admin_allowed(
+        event.user_id, group_id,
+        config.allowed_groups, config.allowed_users, config.admin_users,
     )
 
 
@@ -950,7 +960,7 @@ async def _addr_update_init(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1049,7 +1059,7 @@ add_cmd = on_command(
 
 @add_cmd.handle()
 async def _add_init(matcher: Matcher, event: MessageEvent):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1299,7 +1309,7 @@ async def _uuid_update_init(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1415,7 +1425,7 @@ async def _del_init(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1478,7 +1488,7 @@ async def _update_token_init(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1561,7 +1571,7 @@ async def _rename_init(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1672,7 +1682,7 @@ add_account_cmd = on_command(
 
 @add_account_cmd.handle()
 async def _add_account_init(matcher: Matcher, event: MessageEvent):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1762,7 +1772,7 @@ list_accounts_cmd = on_command(
 
 @list_accounts_cmd.handle()
 async def _list_accounts(matcher: Matcher, event: MessageEvent):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1803,7 +1813,7 @@ async def _del_account_init(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -1867,7 +1877,7 @@ async def _bind_account(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -2045,7 +2055,7 @@ async def _mc_cmd(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -2268,7 +2278,7 @@ async def _auto_close(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -2360,7 +2370,7 @@ async def _pause_close(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -2408,7 +2418,7 @@ cancel_close_cmd = on_fullmatch(
 
 @cancel_close_cmd.handle()
 async def _cancel_close(matcher: Matcher, event: MessageEvent):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -3068,7 +3078,7 @@ async def _log(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)
@@ -3137,7 +3147,7 @@ async def _restart(
     event: MessageEvent,
     arg: Message = CommandArg(),
 ):
-    ok, reason = _check_perm(event)
+    ok, reason = _check_admin_perm(event)
     if not ok:
         if reason:
             await matcher.finish(reason)

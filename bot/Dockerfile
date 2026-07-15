@@ -25,6 +25,10 @@ RUN pip install --no-cache-dir \
 RUN playwright install --with-deps chromium && \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
+# 凭据加密依赖单独分层，避免安全模块改动触发 Chromium 重新下载。
+COPY requirements-security.txt ./
+RUN pip install --no-cache-dir -r requirements-security.txt
+
 # 再拷代码（代码改动不会让依赖层缓存失效）
 COPY bot.py ./
 COPY plugins/ ./plugins/

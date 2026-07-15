@@ -39,6 +39,27 @@ def is_user_allowed(
     return True, ""
 
 
+def is_admin_allowed(
+    user_id: int,
+    group_id: int | None,
+    allowed_groups: Iterable[int],
+    allowed_users: Iterable[int],
+    admin_users: Iterable[int],
+) -> tuple[bool, str]:
+    """先执行普通权限校验，再要求用户位于管理员名单中。"""
+    ok, reason = is_user_allowed(
+        user_id, group_id, allowed_groups, allowed_users
+    )
+    if not ok:
+        return ok, reason
+    admins = set(admin_users)
+    if not admins:
+        return False, "机器人尚未配置管理员，请在 .env 设置 ADMIN_USERS"
+    if user_id not in admins:
+        return False, "该指令仅限机器人管理员使用"
+    return True, ""
+
+
 def check_cooldown(
     user_id: int,
     command: str,

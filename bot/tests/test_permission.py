@@ -143,3 +143,28 @@ def test_pending_confirm_overwrites():
     permission.mark_pending_confirm(111, "default")
     permission.mark_pending_confirm(111, "GTNH")
     assert permission.consume_pending_confirm(111) == "GTNH"
+
+
+def test_admin_permission_requires_explicit_membership():
+    ok, reason = permission.is_admin_allowed(
+        user_id=111, group_id=12345,
+        allowed_groups=[12345], allowed_users=[], admin_users=[222],
+    )
+    assert ok is False
+    assert "管理员" in reason
+
+    ok, reason = permission.is_admin_allowed(
+        user_id=222, group_id=12345,
+        allowed_groups=[12345], allowed_users=[], admin_users=[222],
+    )
+    assert ok is True
+    assert reason == ""
+
+
+def test_admin_permission_fails_closed_when_unconfigured():
+    ok, reason = permission.is_admin_allowed(
+        user_id=111, group_id=12345,
+        allowed_groups=[12345], allowed_users=[], admin_users=[],
+    )
+    assert ok is False
+    assert "ADMIN_USERS" in reason

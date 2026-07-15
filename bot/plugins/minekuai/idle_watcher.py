@@ -39,6 +39,7 @@ POLL_INTERVAL_SECONDS = 60       # 每分钟查一次
 GRACE_PERIOD_SECONDS = 5 * 60    # 开服后 5 分钟启动宽限
 COUNTDOWN_SECONDS = 60           # 关停前广播 + 倒计时窗口
 SLP_TIMEOUT_SECONDS = 5          # SLP 单次查询超时
+SLP_BACKOFF_SECONDS = (30, 60, 120, 300)  # 连续失败后的重试退避
 KEEPALIVE_AFTER_SECONDS = 6 * 24 * 60 * 60   # 6 天没启动就保活一次
 KEEPALIVE_RUNTIME_SECONDS = 5 * 60           # 保活启动后运行 5 分钟再关
 
@@ -69,6 +70,10 @@ _pause_until: float = 0.0
 # 上一轮观察到的玩家名集合 / 在线人数(重启后第一轮只记录,不广播)
 _last_player_names: dict[str, set[str]] = {}
 _last_online_count: dict[str, int] = {}
+
+# SLP 连续失败次数与下次允许后台重试时间；显式“在线”查询不受影响
+_slp_failures: dict[str, int] = {}
+_slp_retry_after: dict[str, float] = {}
 
 # ---- 日志事件播报 + 在线时长 ----
 # 每个服务器 latest.log 上一轮已处理到的行数(用于增量)
@@ -295,7 +300,7 @@ async def _ready_loop(
         await asyncio.sleep(initial_delay)
         deadline = time() + timeout
         while time() < deadline:
-            status = await query_status(address)
+            status = await query_status(address, use_backoff=True)
             if status is not None:
                 tail = (
                     f" ({status.online}/{status.max} 在线)"
@@ -426,7 +431,7 @@ async def _tick() -> None:
 
         # SLP:给空闲关停用;没法走面板的服务器还用它做粗略上下线播报
         try:
-            status = await query_status(s.address)
+            status = await query_status(s.address, use_backoff=True)
         except Exception:
             logger.exception(f"[idle] 查 {s.name} SLP 时异常")
             status = None
@@ -493,7 +498,7 @@ async def _looks_running(s: servers.Server) -> bool:
             return False
 
     if s.address:
-        status = await query_status(s.address)
+        status = await query_status(s.address, use_backoff=True)
         return bool(status and status.online > 0)
     return False
 
@@ -1091,11 +1096,33 @@ class SlpStatus:
     version: str = ""
 
 
-async def query_status(address: str) -> SlpStatus | None:
+def _normalize_slp_address(address: str) -> str:
+    addr = address.strip()
+    if addr and ":" not in addr:
+        addr = f"{addr}:25565"
+    return addr
+
+
+def _record_slp_failure(addr: str) -> None:
+    failures = _slp_failures.get(addr, 0) + 1
+    _slp_failures[addr] = failures
+    delay = SLP_BACKOFF_SECONDS[min(failures - 1, len(SLP_BACKOFF_SECONDS) - 1)]
+    _slp_retry_after[addr] = time() + delay
+    logger.warning(f"[idle] SLP 查询 {addr} 连续失败 {failures} 次，{delay} 秒后重试")
+
+
+def _clear_slp_backoff(addr: str) -> None:
+    _slp_failures.pop(addr, None)
+    _slp_retry_after.pop(addr, None)
+
+
+async def query_status(
+    address: str, *, use_backoff: bool = False,
+) -> SlpStatus | None:
     """查 Minecraft 服务器的完整状态。失败/不可达返回 None。
 
-    这是公开的查询接口，给 `在线` 指令用。
-    内部的轮询监视器走 _query_slp 即可（只要在线数）。
+    后台轮询设置 use_backoff=True，连续失败时按 30/60/120/300 秒退避；
+    用户显式执行“在线”查询仍会立即尝试。
     """
     try:
         from mcstatus import JavaServer
@@ -1103,11 +1130,16 @@ async def query_status(address: str) -> SlpStatus | None:
         logger.error("[idle] mcstatus 未安装，无法查 SLP")
         return None
 
-    addr = address.strip()
+    addr = _normalize_slp_address(address)
     if not addr:
         return None
-    if ":" not in addr:
-        addr = f"{addr}:25565"
+    retry_after = _slp_retry_after.get(addr, 0.0)
+    if use_backoff and time() < retry_after:
+        logger.debug(
+            f"[idle] SLP 查询 {addr} 处于退避期，"
+            f"{max(1, int(retry_after - time()))} 秒后再试"
+        )
+        return None
     try:
         server = await asyncio.wait_for(
             JavaServer.async_lookup(addr),
@@ -1116,12 +1148,13 @@ async def query_status(address: str) -> SlpStatus | None:
         status = await asyncio.wait_for(
             server.async_status(), timeout=SLP_TIMEOUT_SECONDS,
         )
-        # 玩家名字列表（sample 可能为 None）
         names: list[str] = []
         if status.players.sample:
-            for p in status.players.sample:
-                if getattr(p, "name", None):
-                    names.append(p.name)
+            for player in status.players.sample:
+                if getattr(player, "name", None):
+                    names.append(player.name)
+        if use_backoff:
+            _clear_slp_backoff(addr)
         return SlpStatus(
             online=status.players.online,
             max=status.players.max,
@@ -1130,15 +1163,20 @@ async def query_status(address: str) -> SlpStatus | None:
             version=getattr(status.version, "name", "") or "",
         )
     except asyncio.TimeoutError:
+        if use_backoff:
+            _record_slp_failure(addr)
         return None
-    except Exception as e:
-        logger.debug(f"[idle] SLP 查询 {addr} 失败: {type(e).__name__}: {e}")
+    except Exception as exc:
+        if use_backoff:
+            _record_slp_failure(addr)
+        logger.debug(
+            f"[idle] SLP 查询 {addr} 失败: {type(exc).__name__}: {exc}"
+        )
         return None
-
 
 async def _query_slp(address: str) -> int | None:
     """轮询用的轻量版本——只要在线数，失败返回 None"""
-    s = await query_status(address)
+    s = await query_status(address, use_backoff=True)
     return s.online if s is not None else None
 
 
