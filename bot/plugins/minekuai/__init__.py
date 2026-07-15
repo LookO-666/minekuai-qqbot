@@ -55,6 +55,7 @@
 token 失效时：如果服务器绑了账号，bot 会用 Playwright 自动登录刷新；
 没绑账号则提示用户『更新token <名字>』手动更新。
 """
+import asyncio
 import re
 from pathlib import Path
 
@@ -122,10 +123,26 @@ _driver = get_driver()
 _idle_task = None  # 持有 task 避免被 GC
 
 
+def _loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """把事件循环层面的未回收异常写入结构化日志，便于定位来源。"""
+    message = context.get("message", "事件循环发生未处理异常")
+    source = context.get("task") or context.get("future") or context.get("handle")
+    exc = context.get("exception")
+    detail = f"{message}; source={source!r}"
+    if exc is not None:
+        logger.opt(exception=exc).error(detail)
+    else:
+        logger.error(detail)
+
+
 @_driver.on_bot_connect
 async def _on_bot_connect(bot: Bot):
     """bot 连上后启动 idle_watcher（每次重连都重置一下）"""
     global _idle_task
+    loop = asyncio.get_running_loop()
+    if loop.get_exception_handler() is not _loop_exception_handler:
+        loop.set_exception_handler(_loop_exception_handler)
+        logger.info("已安装事件循环异常处理器")
     idle_watcher.register_bot(bot, config.allowed_groups)
     idle_watcher.register_close_callback(_auto_close_callback)
     idle_watcher.register_start_callback(_auto_start_callback)

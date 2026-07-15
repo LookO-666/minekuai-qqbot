@@ -17,7 +17,9 @@ services:
     - ./napcat-data/QQ:/app/.config/QQ
     - ./napcat-data/config:/app/napcat/config
   bot:
-    build: ./bot
+    build:
+      context: ./bot
+      target: runtime
     container_name: minekuai-bot
     restart: unless-stopped
     network_mode: host
@@ -29,3 +31,12 @@ services:
     - OPERATION_LOG_DB=/app/data/operation_log.db
     volumes:
     - ./bot-data:/app/data
+  test:
+    profiles:
+    - test
+    build:
+      context: ./bot
+      target: test
+    network_mode: none
+    environment:
+    - OPERATION_LOG_DB=/tmp/minekuai-test.db

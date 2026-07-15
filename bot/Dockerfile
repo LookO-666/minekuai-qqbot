@@ -1,5 +1,5 @@
 # 机器人镜像 - 基于 Python 3.11 slim
-FROM python:3.11-slim
+FROM python:3.11-slim AS runtime
 
 # 设置时区为东八区，日志时间才对得上
 ENV TZ=Asia/Shanghai
@@ -37,3 +37,17 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "bot.py"]
+
+
+# 测试镜像单独安装测试依赖，避免增大生产镜像。
+FROM python:3.11-slim AS test
+
+WORKDIR /app
+
+COPY requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+COPY plugins/ ./plugins/
+COPY tests/ ./tests/
+
+CMD ["pytest", "-q"]

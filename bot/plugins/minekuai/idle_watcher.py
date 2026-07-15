@@ -146,6 +146,27 @@ _close_callback = None
 
 
 # ============================================================
+# 后台任务管理
+# ============================================================
+
+def _consume_task_result(task: asyncio.Task) -> None:
+    """回收后台任务结果，避免异常停留在无人 await 的 Future 中。"""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception(f"[task] 后台任务异常: {task.get_name()}")
+
+
+def _create_task(coro, *, name: str) -> asyncio.Task:
+    """创建带名称的后台任务，并确保结束时取走异常。"""
+    task = asyncio.create_task(coro, name=name)
+    task.add_done_callback(_consume_task_result)
+    return task
+
+
+# ============================================================
 # 注入 + 启动
 # ============================================================
 
@@ -185,7 +206,7 @@ def register_panel_runner(runner) -> None:
 
 def start_watcher() -> asyncio.Task:
     """启动后台循环。返回 Task 引用，调用方持有避免被 GC。"""
-    task = asyncio.create_task(_watch_loop())
+    task = _create_task(_watch_loop(), name="minekuai-idle-watcher")
     logger.info(
         f"[idle-watcher] 已启动 (轮询 {POLL_INTERVAL_SECONDS}s "
         f"/ grace {GRACE_PERIOD_SECONDS}s / countdown {COUNTDOWN_SECONDS}s)"
@@ -257,8 +278,9 @@ def watch_for_ready(
     existing = _ready_watchers.get(server.name)
     if existing is not None and not existing.done():
         return
-    task = asyncio.create_task(
-        _ready_loop(server.name, server.address, initial_delay, poll_interval, timeout)
+    task = _create_task(
+        _ready_loop(server.name, server.address, initial_delay, poll_interval, timeout),
+        name=f"minekuai-ready:{server.name}",
     )
     _ready_watchers[server.name] = task
 
@@ -450,8 +472,9 @@ async def _check_keepalive(s: servers.Server) -> None:
         return
 
     logger.info(f"[keepalive] {s.name} 已 {int(age // 86400)} 天未启动，开始保活")
-    _keepalive_tasks[s.name] = asyncio.create_task(
-        _keepalive_cycle(s.name, int(age // 86400))
+    _keepalive_tasks[s.name] = _create_task(
+        _keepalive_cycle(s.name, int(age // 86400)),
+        name=f"minekuai-keepalive:{s.name}",
     )
 
 
@@ -537,7 +560,9 @@ async def _check_idle(s: servers.Server, status: "SlpStatus | None") -> None:
         logger.info(
             f"[idle] {s.name} 已空闲 {int(idle_seconds/60)} 分钟,触发关停倒计时"
         )
-        task = asyncio.create_task(_countdown_close(s))
+        task = _create_task(
+            _countdown_close(s), name=f"minekuai-auto-close:{s.name}"
+        )
         _pending_close[s.name] = task
 
 
@@ -701,7 +726,9 @@ def _ensure_ws(s: servers.Server) -> None:
     t = _ws_tasks.get(s.name)
     if t is not None and not t.done():
         return
-    _ws_tasks[s.name] = asyncio.create_task(_ws_loop(s))
+    _ws_tasks[s.name] = _create_task(
+        _ws_loop(s), name=f"minekuai-ws:{s.name}"
+    )
 
 
 def _stop_ws(name: str) -> None:
