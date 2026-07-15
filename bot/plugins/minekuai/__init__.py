@@ -3320,7 +3320,7 @@ async def _help(matcher: Matcher, event: MessageEvent):
         "\n"
         f"指令冷却：{config.command_cooldown} 秒\n"
         "项目地址：\n"
-        "[LookO-666/minekuai-qqbot]"
-        "(https://github.com/LookO-666/minekuai-qqbot)"
+        "LookO-666/minekuai-qqbot\n"
+        "https://github.com/LookO-666/minekuai-qqbot"
     )
     await matcher.finish(text)
