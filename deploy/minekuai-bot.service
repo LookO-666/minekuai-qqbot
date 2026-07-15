@@ -15,7 +15,7 @@
 
 [Unit]
 Description=Minekuai QQ Bot
-Documentation=https://github.com/your-repo/minekuai-qqbot
+Documentation=https://github.com/LookO-666/minekuai-qqbot
 After=network-online.target
 Wants=network-online.target
 

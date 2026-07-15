@@ -1,5 +1,8 @@
 # 麦块联机 QQ Bot
 
+[![Tests](https://github.com/LookO-666/minekuai-qqbot/actions/workflows/tests.yml/badge.svg)](https://github.com/LookO-666/minekuai-qqbot/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 群里发一句 `开服`，bot 自动开 [麦块联机](https://minekuai.com) 的计时卡 **+** 启动服务器实例，全自动，玩家直接进。
 
 > **简短历程**：v1 只开计时卡；v2 加 token 自动续期；v3 用面板 session 自动启动实例；v4 改用 Pterodactyl Client API Key，面板控制不再依赖短期 cookies。**现在全自动**。
@@ -143,7 +146,7 @@ minekuai-qqbot/
 ### 1. 克隆 + 进目录
 
 ```bash
-git clone https://github.com/<你>/minekuai-qqbot.git
+git clone https://github.com/LookO-666/minekuai-qqbot.git
 cd minekuai-qqbot
 ```
 
@@ -498,6 +501,12 @@ docker compose --profile test run --rm test
 
 ---
 
+## 参与贡献
+
+欢迎提交 Issue 和 Pull Request。开始修改前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要在公开 Issue 中粘贴凭据。
+
+---
+
 ## License
 
 [MIT](LICENSE)
@@ -506,5 +515,5 @@ docker compose --profile test run --rm test
 
 ## 致谢
 
-- 麦块联机不开放公开 API，所有接口路径都是从浏览器 F12 抓出来的。如果哪天接口又改了，欢迎 PR 修正。
-- 作者：[@klukeyuan](mailto:klukeyuan@gmail.com)
+- 本项目会调用麦块联机网页端及 Pterodactyl Client API；这些接口可能调整，若失效欢迎 PR 修正。
+- 原作者：[@klukeyuan](mailto:klukeyuan@gmail.com)
