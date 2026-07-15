@@ -27,3 +27,4 @@ jobs:
         run: python -m pip install -r bot/requirements-dev.txt
 
       - name: Run tests
+        run: python -m pytest bot/tests
