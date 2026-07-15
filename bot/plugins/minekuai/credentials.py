@@ -71,19 +71,21 @@ def migrate_plaintext_credentials(conn: sqlite3.Connection) -> dict[str, int]:
             counts["server_tokens"] += 1
 
     rows = conn.execute(
-        "SELECT phone, password, session_cookie, xsrf_token FROM accounts"
+        "SELECT phone, password, session_cookie, xsrf_token, panel_api_key "
+        "FROM accounts"
     ).fetchall()
-    for phone, password, session_cookie, xsrf_token in rows:
+    for phone, password, session_cookie, xsrf_token, panel_api_key in rows:
         encrypted = (
             encrypt_secret(password),
             encrypt_secret(session_cookie),
             encrypt_secret(xsrf_token),
+            encrypt_secret(panel_api_key),
         )
-        original = (password, session_cookie, xsrf_token)
+        original = (password, session_cookie, xsrf_token, panel_api_key)
         if encrypted != original:
             conn.execute(
                 "UPDATE accounts SET password = ?, session_cookie = ?, "
-                "xsrf_token = ? WHERE phone = ?",
+                "xsrf_token = ?, panel_api_key = ? WHERE phone = ?",
                 (*encrypted, phone),
             )
             counts["account_secrets"] += sum(

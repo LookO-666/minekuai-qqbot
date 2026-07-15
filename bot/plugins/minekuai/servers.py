@@ -50,6 +50,7 @@ class Account:
     password: str
     session_cookie: str         # Playwright 登录后捕获的整段 cookie，调 panel API 用
     xsrf_token: str             # 同一次登录里抓的 X-XSRF-TOKEN header 值
+    panel_api_key: str          # Pterodactyl Client API Key（优先于 cookies）
     created_at: int
     updated_at: int
     last_refresh_at: int        # 上次成功刷新 token 的时间戳
@@ -61,7 +62,7 @@ _SERVER_COLS = (
     "created_at, updated_at"
 )
 _ACCOUNT_COLS = (
-    "phone, password, session_cookie, xsrf_token, "
+    "phone, password, session_cookie, xsrf_token, panel_api_key, "
     "created_at, updated_at, last_refresh_at"
 )
 
@@ -77,6 +78,7 @@ def _account_from_row(row) -> Account:
     values[1] = decrypt_secret(values[1])
     values[2] = decrypt_secret(values[2])
     values[3] = decrypt_secret(values[3])
+    values[4] = decrypt_secret(values[4])
     return Account(*values)
 
 
@@ -112,6 +114,7 @@ def init_db() -> None:
                 password        TEXT NOT NULL,
                 session_cookie  TEXT NOT NULL DEFAULT '',
                 xsrf_token      TEXT NOT NULL DEFAULT '',
+                panel_api_key   TEXT NOT NULL DEFAULT '',
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL,
                 last_refresh_at INTEGER NOT NULL DEFAULT 0
@@ -141,6 +144,7 @@ def init_db() -> None:
         for col_name, col_def in [
             ("session_cookie", "TEXT NOT NULL DEFAULT ''"),
             ("xsrf_token", "TEXT NOT NULL DEFAULT ''"),
+            ("panel_api_key", "TEXT NOT NULL DEFAULT ''"),
         ]:
             if col_name not in acc_cols:
                 conn.execute(
@@ -371,6 +375,19 @@ def update_account_session(
             "UPDATE accounts SET session_cookie = ?, xsrf_token = ?, "
             "last_refresh_at = ?, updated_at = ? WHERE phone = ?",
             (encrypt_secret(session_cookie), encrypt_secret(xsrf_token), now, now, phone),
+        )
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def update_account_panel_api_key(phone: str, api_key: str) -> bool:
+    """保存 Pterodactyl Client API Key；空值用于显式清除。"""
+    now = int(time())
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "UPDATE accounts SET panel_api_key = ?, updated_at = ? "
+            "WHERE phone = ?",
+            (encrypt_secret(api_key), now, phone),
         )
         conn.commit()
     return cur.rowcount > 0

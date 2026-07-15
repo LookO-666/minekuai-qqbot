@@ -16,6 +16,7 @@ MinekuaiClient = client_mod.MinekuaiClient
 AuthError = client_mod.AuthError
 APIError = client_mod.APIError
 RateLimitError = client_mod.RateLimitError
+PanelClient = client_mod.PanelClient
 
 
 def make_client_with_mock(handler):
@@ -153,3 +154,65 @@ async def test_empty_credentials_rejected():
         MinekuaiClient(token="", client_id="x")
     with pytest.raises(ValueError):
         MinekuaiClient(token="x", client_id="")
+
+
+def make_panel_client_with_mock(handler, **kwargs):
+    client = PanelClient(**kwargs)
+    client._http = httpx.AsyncClient(
+        base_url=PanelClient.BASE_URL,
+        headers=client._build_headers(),
+        transport=httpx.MockTransport(handler),
+    )
+    return client
+
+
+@pytest.mark.asyncio
+async def test_panel_client_prefers_api_key():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization")
+        captured["cookie"] = request.headers.get("cookie")
+        captured["xsrf"] = request.headers.get("x-xsrf-token")
+        return httpx.Response(200, json={"object": "server"})
+
+    client = make_panel_client_with_mock(
+        handler,
+        api_key="ptlc_test-key",
+        session_cookie="legacy-cookie",
+        xsrf_token="legacy-xsrf",
+    )
+    await client.get_server_info("server-id")
+    await client._http.aclose()
+
+    assert captured["authorization"] == "Bearer ptlc_test-key"
+    assert captured["cookie"] is None
+    assert captured["xsrf"] is None
+
+
+@pytest.mark.asyncio
+async def test_panel_client_keeps_session_fallback():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization")
+        captured["cookie"] = request.headers.get("cookie")
+        captured["xsrf"] = request.headers.get("x-xsrf-token")
+        return httpx.Response(200, json={"object": "server"})
+
+    client = make_panel_client_with_mock(
+        handler,
+        session_cookie="legacy-cookie",
+        xsrf_token="legacy-xsrf",
+    )
+    await client.get_server_info("server-id")
+    await client._http.aclose()
+
+    assert captured["authorization"] is None
+    assert captured["cookie"] == "legacy-cookie"
+    assert captured["xsrf"] == "legacy-xsrf"
+
+
+def test_panel_client_requires_one_auth_method():
+    with pytest.raises(ValueError):
+        PanelClient()

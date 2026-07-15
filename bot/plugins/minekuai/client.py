@@ -5,8 +5,8 @@
 - start_timing / stop_timing：开关计时卡（控制扣费）
 - verify_eula：触发实例启动（同一套 Bearer 认证，不需要 cookies）
 
-PanelClient（minekuai.com/api/client/...，cookies + XSRF）保留作为备选——
-万一某个 endpoint 只在 Pterodactyl 路径上能用，可以走这边。
+PanelClient（minekuai.com/api/client/...）优先使用长期 Client API Key；
+旧的 cookies + XSRF 认证保留为兼容回退。
 
 设计原则:
 - 所有 HTTP 调用都封装在这里，业务逻辑不直接碰 httpx
@@ -173,16 +173,22 @@ class MinekuaiClient:
 class PanelClient:
     """麦块联机 Pterodactyl 面板 API 客户端（异步）
 
-    通过 4 个 GET 预检查触发服务器实例启动。认证用 Laravel session cookies +
-    X-XSRF-TOKEN，需要由调用方先经 auth.refresh_token 拿到。
+    通过标准 Pterodactyl Client API 控制服务器。优先使用长期 API Key；
+    未配置 API Key 时兼容 Laravel session cookies + X-XSRF-TOKEN。
     """
 
     BASE_URL = "https://minekuai.com"
     DEFAULT_TIMEOUT = 30.0   # 面板调用比计时卡慢，容差大一些
 
-    def __init__(self, session_cookie: str, xsrf_token: str):
-        if not session_cookie or not xsrf_token:
-            raise ValueError("session_cookie 和 xsrf_token 不能为空")
+    def __init__(
+        self,
+        api_key: str = "",
+        session_cookie: str = "",
+        xsrf_token: str = "",
+    ):
+        if not api_key and not (session_cookie and xsrf_token):
+            raise ValueError("panel_api_key 或 session_cookie + xsrf_token 至少配置一组")
+        self._api_key = api_key
         self._cookie = session_cookie
         self._xsrf = xsrf_token
         self._http: httpx.AsyncClient | None = None
@@ -201,9 +207,7 @@ class PanelClient:
             self._http = None
 
     def _build_headers(self) -> dict[str, str]:
-        return {
-            "Cookie": self._cookie,
-            "X-XSRF-TOKEN": self._xsrf,
+        headers = {
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "Origin": "https://minekuai.com",
@@ -215,6 +219,12 @@ class PanelClient:
             ),
             "X-Requested-With": "XMLHttpRequest",
         }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        else:
+            headers["Cookie"] = self._cookie
+            headers["X-XSRF-TOKEN"] = self._xsrf
+        return headers
 
     async def _request(
         self,
@@ -233,11 +243,10 @@ class PanelClient:
         except httpx.HTTPError as e:
             raise APIError(f"面板网络错误: {e}") from e
 
-        # 401: session 失效；419: CSRF 过期（Laravel 风格）
         if r.status_code in (401, 419):
+            auth_type = "API Key" if self._api_key else "session/CSRF"
             raise AuthError(
-                f"面板 session/CSRF 失效 (HTTP {r.status_code})，"
-                f"需要重新登录刷新 cookies"
+                f"面板 {auth_type} 认证失败 (HTTP {r.status_code})"
             )
 
         if r.status_code >= 400:
@@ -363,8 +372,9 @@ class PanelClient:
         except httpx.HTTPError as e:
             raise APIError(f"网络错误: {e}") from e
         if r.status_code in (401, 419):
+            auth_type = "API Key" if self._api_key else "session/CSRF"
             raise AuthError(
-                f"面板 session/CSRF 失效 (HTTP {r.status_code})"
+                f"面板 {auth_type} 认证失败 (HTTP {r.status_code})"
             )
         if r.status_code >= 400:
             raise APIError(f"面板 HTTP {r.status_code}: {r.text[:200]}")

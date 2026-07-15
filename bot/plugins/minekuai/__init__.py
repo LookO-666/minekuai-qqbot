@@ -353,6 +353,21 @@ def _build_client(server: servers.Server) -> MinekuaiClient:
     return MinekuaiClient(token=server.token, client_id=server.client_id)
 
 
+def _account_has_panel_auth(account: servers.Account) -> bool:
+    return bool(
+        account.panel_api_key
+        or (account.session_cookie and account.xsrf_token)
+    )
+
+
+def _build_panel_client(account: servers.Account) -> PanelClient:
+    return PanelClient(
+        api_key=account.panel_api_key,
+        session_cookie=account.session_cookie,
+        xsrf_token=account.xsrf_token,
+    )
+
+
 def _format_server_names(servers_list: list[servers.Server]) -> str:
     return "、".join(f"『{s.name}』" for s in servers_list)
 
@@ -403,7 +418,7 @@ async def _refresh_token_for(server: servers.Server) -> tuple[bool, str]:
 async def _ensure_panel_auth(
     server: servers.Server,
 ) -> tuple[bool, str, servers.Server]:
-    """确保账号有可用的面板 cookies；没有就主动登录一次。
+    """确保账号有可用的面板 API Key 或兼容 session。
 
     返回 (成功?, 状态消息, 重新读取后的 server)。
     """
@@ -412,18 +427,19 @@ async def _ensure_panel_auth(
     account = servers.get_account(server.account_phone)
     if not account:
         return False, f"绑定的账号 {server.account_phone} 不存在", server
+    if account.panel_api_key:
+        return True, "已有 Client API Key", server
     if account.session_cookie and account.xsrf_token:
-        return True, "已有 cookies", server
+        return True, "使用兼容 session", server
     ok, msg = await _refresh_token_for(server)
     return ok, msg, servers.get_server(server.name) or server
-
 
 async def _start_instance(
     matcher: Matcher,
     server: servers.Server,
 ) -> tuple[bool, str]:
     """通过 panel POST /power signal=start 启动实例。
-    cookies 失效时自动刷一次再重试。
+    优先使用 Client API Key；兼容 session 失效时自动刷新一次。
     """
     if not server.instance_uuid:
         return False, "未配置 instance_uuid，跳过实例启动"
@@ -434,22 +450,22 @@ async def _start_instance(
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not account.session_cookie or not account.xsrf_token:
-            return False, "面板 cookies 丢失"
+        if not account or not _account_has_panel_auth(account):
+            return False, "面板 API 凭据丢失"
 
         try:
-            async with PanelClient(
-                account.session_cookie, account.xsrf_token,
-            ) as panel:
+            async with _build_panel_client(account) as panel:
                 await panel.start_instance(server.instance_uuid)
             return True, "start 信号已下达"
 
         except AuthError as e:
+            if account.panel_api_key:
+                return False, f"面板 API Key 已失效或被撤销：{e}"
             if refresh_attempted:
                 return False, f"刷新后仍认证失败：{e}"
             refresh_attempted = True
             await matcher.send(
-                f"⏳ 面板 cookies 失效，正在用账号 "
+                f"⏳ 面板兼容 session 失效，正在用账号 "
                 f"{_mask_phone(server.account_phone)} 重新登录..."
             )
             ok, msg = await _refresh_token_for(server)
@@ -1793,7 +1809,15 @@ async def _list_accounts(matcher: Matcher, event: MessageEvent):
     for acc in accounts:
         bound = usage.get(acc.phone, [])
         bound_str = "、".join(bound) if bound else "无绑定服务器"
-        lines.append(f"  ▸ {_mask_phone(acc.phone)} → {bound_str}")
+        if acc.panel_api_key:
+            auth_mode = "Client API Key"
+        elif acc.session_cookie and acc.xsrf_token:
+            auth_mode = "兼容 session"
+        else:
+            auth_mode = "未取得面板凭据"
+        lines.append(
+            f"  ▸ {_mask_phone(acc.phone)} → {bound_str}｜{auth_mode}"
+        )
     await matcher.finish("\n".join(lines))
 
 
@@ -2112,13 +2136,11 @@ async def _mc_cmd(
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not account.session_cookie or not account.xsrf_token:
-            await matcher.finish("❌ 面板 cookies 丢失")
+        if not account or not _account_has_panel_auth(account):
+            await matcher.finish("❌ 面板 API 凭据丢失")
 
         try:
-            async with PanelClient(
-                account.session_cookie, account.xsrf_token,
-            ) as panel:
+            async with _build_panel_client(account) as panel:
                 await panel.send_command(server.instance_uuid, command)
             log_operation(
                 user_id, user_name, group_id,
@@ -2129,11 +2151,13 @@ async def _mc_cmd(
             )
 
         except AuthError as e:
+            if account.panel_api_key:
+                await matcher.finish(f"❌ 面板 API Key 已失效或被撤销：{e}")
             if refresh_attempted:
                 await matcher.finish(f"❌ 鉴权后仍失败：{e}")
             refresh_attempted = True
             await matcher.send(
-                f"⏳ cookies 失效,用账号 "
+                f"⏳ 面板兼容 session 失效,用账号 "
                 f"{_mask_phone(server.account_phone)} 刷新中..."
             )
             ok, msg = await _refresh_token_for(server)
@@ -2471,7 +2495,7 @@ def _fmt_mb(mb: float | int | None) -> str:
 
 
 async def _with_panel_refresh(matcher: Matcher, server, fn):
-    """调 PanelClient 操作,401/419 自动刷一次 token 再重试。
+    """调 PanelClient 操作；API Key 优先，兼容 session 可自动刷新。
     返回 (result | None, err_msg, server)。
     """
     ok, msg, server = await _ensure_panel_auth(server)
@@ -2481,20 +2505,20 @@ async def _with_panel_refresh(matcher: Matcher, server, fn):
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not account.session_cookie or not account.xsrf_token:
-            return None, "面板 cookies 丢失", server
+        if not account or not _account_has_panel_auth(account):
+            return None, "面板 API 凭据丢失", server
         try:
-            async with PanelClient(
-                account.session_cookie, account.xsrf_token,
-            ) as panel:
+            async with _build_panel_client(account) as panel:
                 result = await fn(panel)
             return result, "ok", server
         except AuthError as e:
+            if account.panel_api_key:
+                return None, f"面板 API Key 已失效或被撤销: {e}", server
             if refresh_attempted:
                 return None, f"刷新后仍认证失败: {e}", server
             refresh_attempted = True
             await matcher.send(
-                f"⏳ 面板 cookies 失效,正在用账号 "
+                f"⏳ 面板兼容 session 失效,正在用账号 "
                 f"{_mask_phone(server.account_phone)} 重新登录..."
             )
             ok, msg = await _refresh_token_for(server)
@@ -2511,7 +2535,7 @@ async def _with_panel_refresh(matcher: Matcher, server, fn):
 
 async def _panel_run_bg(server, fn):
     """后台(无 matcher)版的面板调用器,供 idle_watcher 注入使用。
-    401/419 自动刷一次 token。返回 (result | None, err_msg)。
+    API Key 优先；兼容 session 的 401/419 自动刷新。返回 (result | None, err_msg)。
     """
     ok, msg, server = await _ensure_panel_auth(server)
     if not ok:
@@ -2519,19 +2543,21 @@ async def _panel_run_bg(server, fn):
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not account.session_cookie or not account.xsrf_token:
-            return None, "面板 cookies 丢失"
+        if not account or not _account_has_panel_auth(account):
+            return None, "面板 API 凭据丢失"
         try:
-            async with PanelClient(
-                account.session_cookie, account.xsrf_token,
-            ) as panel:
+            async with _build_panel_client(account) as panel:
                 result = await fn(panel)
             return result, "ok"
         except AuthError as e:
+            if account.panel_api_key:
+                return None, f"面板 API Key 已失效或被撤销: {e}"
             if refresh_attempted:
                 return None, f"刷新后仍认证失败: {e}"
             refresh_attempted = True
-            logger.info(f"[panel-bg] {server.name} cookies 失效,自动刷新")
+            logger.info(
+                f"[panel-bg] {server.name} 兼容 session 失效,自动刷新"
+            )
             ok, msg = await _refresh_token_for(server)
             if not ok:
                 return None, f"刷新失败: {msg}"

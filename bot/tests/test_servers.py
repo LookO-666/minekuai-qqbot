@@ -230,6 +230,9 @@ def test_sensitive_values_are_encrypted_at_rest(servers_mod):
     servers_mod.update_account_session(
         "13900000000", "laravel-cookie", "xsrf-value"
     )
+    servers_mod.update_account_panel_api_key(
+        "13900000000", "ptlc_secret-key"
+    )
     servers_mod.add_server("X", "1", "secret-token", "client-id")
 
     with servers_mod._connect() as conn:
@@ -237,7 +240,8 @@ def test_sensitive_values_are_encrypted_at_rest(servers_mod):
             "SELECT token FROM servers WHERE name = 'X'"
         ).fetchone()[0]
         raw_account = conn.execute(
-            "SELECT password, session_cookie, xsrf_token FROM accounts "
+            "SELECT password, session_cookie, xsrf_token, panel_api_key "
+            "FROM accounts "
             "WHERE phone = '13900000000'"
         ).fetchone()
 
@@ -248,6 +252,7 @@ def test_sensitive_values_are_encrypted_at_rest(servers_mod):
     assert account.password == "secret-password"
     assert account.session_cookie == "laravel-cookie"
     assert account.xsrf_token == "xsrf-value"
+    assert account.panel_api_key == "ptlc_secret-key"
 
 
 def test_plaintext_credentials_migrate_once(servers_mod):
@@ -261,15 +266,21 @@ def test_plaintext_credentials_migrate_once(servers_mod):
         )
         conn.execute(
             "INSERT INTO accounts "
-            "(phone, password, session_cookie, xsrf_token, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            ("13900000000", "plain-pw", "plain-cookie", "plain-xsrf", now, now),
+            "(phone, password, session_cookie, xsrf_token, panel_api_key, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "13900000000", "plain-pw", "plain-cookie", "plain-xsrf",
+                "ptlc_plain-key", now, now,
+            ),
         )
         first = servers_mod.migrate_plaintext_credentials(conn)
         second = servers_mod.migrate_plaintext_credentials(conn)
         conn.commit()
 
-    assert first == {"server_tokens": 1, "account_secrets": 3}
+    assert first == {"server_tokens": 1, "account_secrets": 4}
     assert second == {"server_tokens": 0, "account_secrets": 0}
     assert servers_mod.get_server("legacy").token == "plain-token"
-    assert servers_mod.get_account("13900000000").password == "plain-pw"
+    account = servers_mod.get_account("13900000000")
+    assert account.password == "plain-pw"
+    assert account.panel_api_key == "ptlc_plain-key"
