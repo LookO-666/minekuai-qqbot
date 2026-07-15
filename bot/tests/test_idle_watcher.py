@@ -36,6 +36,8 @@ def idle_watcher_mod(monkeypatch):
     spec.loader.exec_module(module)
     module._slp_failures.clear()
     module._slp_retry_after.clear()
+    module._breach_count.clear()
+    module._last_alert_at.clear()
     return module
 
 
@@ -81,3 +83,34 @@ async def test_explicit_query_bypasses_background_backoff(
     background = await idle_watcher_mod.query_status(
         addr, use_backoff=True,
     )
+    assert background is None
+    explicit = await idle_watcher_mod.query_status(addr)
+    assert explicit is not None
+    assert explicit.online == 2
+    assert FakeJavaServer.lookup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_resource_alert_mentions_admins_not_all_allowed_users(
+    idle_watcher_mod, monkeypatch,
+):
+    idle_watcher_mod._config = types.SimpleNamespace(
+        alert_sustained_ticks=1,
+        alert_cooldown_minutes=30,
+        admin_users=[222],
+        allowed_users=[111],
+    )
+    monkeypatch.setattr(idle_watcher_mod, "time", lambda: 1_000.0)
+    sent = []
+
+    async def fake_broadcast(text):
+        sent.append(text)
+
+    monkeypatch.setattr(idle_watcher_mod, "_broadcast", fake_broadcast)
+    server = types.SimpleNamespace(name="test")
+
+    await idle_watcher_mod._eval_breach(
+        server, "cpu", True, "CPU alert",
+    )
+
+    assert sent == ["CPU alert [CQ:at,qq=222]"]

@@ -1030,12 +1030,12 @@ async def _eval_breach(
     # 冷却,避免持续高负载时反复刷屏
     now = time()
     last = _last_alert_at.get(key, 0)
-    if now - last < _config.alert_cooldown_minutes * 60:
+    if last and now - last < _config.alert_cooldown_minutes * 60:
         return
     _last_alert_at[key] = now
     at = ""
-    if _config.allowed_users:
-        at = " " + " ".join(f"[CQ:at,qq={u}]" for u in _config.allowed_users)
+    if _config.admin_users:
+        at = " " + " ".join(f"[CQ:at,qq={u}]" for u in _config.admin_users)
     await _broadcast(alert_text + at)
 
 

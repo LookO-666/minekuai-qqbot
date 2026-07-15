@@ -97,7 +97,7 @@ from .permission import (
 
 __plugin_meta__ = PluginMetadata(
     name="麦块联机控制",
-    description="多服务器 QQ Bot：开关计时卡 + 运行时管理",
+    description="多服务器 QQ Bot：开关服、群服聊天桥、事件播报和运行时管理",
     usage="发送 帮助 查看指令",
     type="application",
 )
@@ -1740,8 +1740,8 @@ async def _add_account_step_phone(
     prompt=(
         "【2/2】请输入登录密码\n"
         "\n"
-        "⚠️ 密码会以明文存在本机的 SQLite 数据库里。\n"
-        "    跟现在 token 在 DB 里是同样的敏感级别。\n"
+        "🔐 密码会使用 CREDENTIAL_ENCRYPTION_KEY 加密后存入 SQLite。\n"
+        "    请妥善备份密钥，不要提交 .env 或数据库。\n"
         "    建议给 minekuai 设一个独立密码，别跟其它地方共用。\n"
         "\n"
         "发『取消』中止"
@@ -2818,6 +2818,9 @@ async def _bind(
     parts = arg.extract_plain_text().split()
     # 管理员可 “绑定 <QQ> <MC名>” 替别人绑;普通 “绑定 <MC名>” 绑自己
     if len(parts) == 2 and parts[0].isdigit():
+        admin_ok, admin_reason = _check_admin_perm(event)
+        if not admin_ok:
+            await matcher.finish(admin_reason or "替他人绑定仅限管理员")
         target_qq = int(parts[0])
         mc_name = parts[1]
     elif len(parts) == 1:
@@ -2860,7 +2863,15 @@ async def _unbind(matcher: Matcher, event: MessageEvent, arg: Message = CommandA
             await matcher.finish(reason)
         return
     parts = arg.extract_plain_text().split()
-    target_qq = int(parts[0]) if (parts and parts[0].isdigit()) else event.user_id
+    if len(parts) > 1 or (parts and not parts[0].isdigit()):
+        await matcher.finish("用法: 解绑\n(管理员可: 解绑 <QQ号>)")
+    if parts:
+        admin_ok, admin_reason = _check_admin_perm(event)
+        if not admin_ok:
+            await matcher.finish(admin_reason or "替他人解绑仅限管理员")
+        target_qq = int(parts[0])
+    else:
+        target_qq = event.user_id
     if servers.unbind_player(target_qq):
         await matcher.finish(f"✅ 已解绑 QQ {target_qq}")
     await matcher.finish(f"QQ {target_qq} 当前没有绑定")
@@ -3268,6 +3279,7 @@ async def _help(matcher: Matcher, event: MessageEvent):
         "━ 玩家绑定 + 统计\n"
         "绑定 <游戏名>        绑 QQ↔游戏名\n"
         "解绑 / 绑定列表\n"
+        "管理员可: 绑定 <QQ> <游戏名> / 解绑 <QQ>\n"
         "今日榜 / 本周榜      在线时长排行\n"
         "在线时长 [游戏名]    查个人时长\n"
         "死亡榜 / 死亡次数    死亡统计\n"
