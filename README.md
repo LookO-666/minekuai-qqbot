@@ -1,208 +1,212 @@
-# 麦块联机 QQ Bot
+# Minekuai QQ Bot
 
 [![Tests](https://github.com/LookO-666/minekuai-qqbot/actions/workflows/tests.yml/badge.svg)](https://github.com/LookO-666/minekuai-qqbot/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-群里发一句 `开服`，bot 自动开 [麦块联机](https://minekuai.com) 的计时卡 **+** 启动服务器实例，全自动，玩家直接进。
+English | [简体中文](README.zh-CN.md)
 
-> **简短历程**：v1 只开计时卡；v2 加 token 自动续期；v3 用面板 session 自动启动实例；v4 改用 Pterodactyl Client API Key，面板控制不再依赖短期 cookies。**现在全自动**。
+Send `开服` (start server) in a QQ group and the bot will start both the [Minekuai](https://minekuai.com) time card **and** the Minecraft server instance. Once the server is ready, players can join immediately.
 
----
-
-## 功能特性
-
-- **一键全自动开服**：同时开启计时卡和服务器实例，启动完成后自动在群里通知“可以进入”
-- **Minecraft ↔ QQ 双向聊天桥**：游戏聊天实时转到 QQ 群；群内普通文本通过 `tellraw` 转回有玩家在线的服务器
-- **实时事件播报**：通过 Pterodactyl WebSocket 监听控制台，播报玩家加入、离开、死亡和成就；WebSocket 不可用时回退轮询 `latest.log`
-- **玩家绑定与统计**：QQ 绑定游戏名后使用群昵称显示，并支持死亡/成就 @、在线时长榜和死亡榜
-- **服务器查询与运维**：在线人数、玩家、延迟、版本、CPU、内存、磁盘、模组、插件、日志、控制台命令和实例重启
-- **智能后台管理**：空闲自动关停、60 秒可取消倒计时、临时暂停、6 天未启动自动保活
-- **资源告警**：CPU/内存持续超过阈值才通知管理员，带连续检测和告警冷却，避免刷屏
-- **多服务器**：一个 bot 可控制多台实例；查询可汇总，管理和运维可指定服务器
-- **自动认证**：计时卡 JWT 失效后通过 Playwright 自动续期；面板优先使用长期 Client API Key，兼容 session 回退
-- **群内交互式配置**：通过指令添加账号和服务器，不必手改数据库或重启 bot
-- **安全持久化**：配置与统计存入 SQLite；token、密码、Client API Key 和会话凭据使用 Fernet 加密
-- **分级权限**：普通用户负责开关服、查询和玩家功能；管理员负责账号、服务器配置和高权限运维
+> **In short:** v1 only controlled time cards; v2 added automatic token renewal; v3 used a panel session to start instances; v4 switched to Pterodactyl Client API Keys, so panel control no longer depends on short-lived cookies. The entire start-up flow is now automated.
 
 ---
 
-## 指令速查
+## Features
 
-默认无前缀，群里直接发送即可。表格中的 🔒 表示仅 `ADMIN_USERS` 管理员可用；其余指令仍受 `ALLOWED_GROUPS`、`ALLOWED_USERS` 和冷却限制。
-
-### 日常开关与查询
-
-| 指令 | 说明 |
-|---|---|
-| `开服 [名字]` / `开机` / `start` | 开启计时卡和实例；多台时不写名字会让用户选择，启动就绪后再次通知 |
-| `关服 [名字]` / `关机` / `stop` | 关闭计时卡；默认进入二次确认 |
-| `确认关服` | 在 5 分钟内确认自己上一条关服请求 |
-| `在线 [名字]` / `人数` / `状态` | 查询在线人数、玩家、延迟、版本和地址；不写名字时汇总所有服务器 |
-| `查服 [名字]` / `info` | 查询实例状态、CPU、内存、磁盘、地址以及模组/插件数量 |
-| `服务器列表` / `列表` | 列出已配置服务器、计时卡 ID 和连接地址 |
-| `服务器地址 [名字]` / `地址` | 查询一台或全部服务器的连接地址 |
-| `模组 [名字]` / `mods` | 列出 `/mods` 下的 JAR |
-| `插件 [名字]` / `plugins` | 列出 `/plugins` 下的 JAR |
-| `mc <正版玩家名>` / `皮肤` | 查询正版 Minecraft 玩家资料并生成图片卡 |
-
-### 群服互通与玩家统计
-
-| 指令/行为 | 说明 |
-|---|---|
-| QQ 群普通文本 | 自动转发到每台“已配置面板且当前有人在线”的服务器，游戏内显示为青色 `[QQ] 群昵称: 内容` |
-| 游戏内聊天 | 通过实时控制台转发到所有 `ALLOWED_GROUPS`；绑定玩家优先显示 QQ 群名片/昵称 |
-| `绑定 <游戏名>` | 把自己的 QQ 绑定到 Minecraft 名字，用于昵称显示、@ 和免参数统计查询 |
-| `解绑` / `绑定列表` | 解除自己的绑定或查看全部绑定；管理员可用 `绑定 <QQ> <游戏名>`、`解绑 <QQ>` 代操作 |
-| `今日榜` / `本周榜` | 查看今日或近 7 天在线时长榜，最多 15 人 |
-| `在线时长 [游戏名]` | 查看今日和近 7 天时长；已绑定时可省略游戏名 |
-| `死亡榜` | 查看累计死亡排行，最多 15 人 |
-| `死亡次数 [游戏名]` | 查看今日和累计死亡次数；已绑定时可省略游戏名 |
-
-### 管理员运维
-
-| 指令 | 说明 |
-|---|---|
-| 🔒 `指令 [名字] <MC命令>` / `cmd` | 向服务器控制台发送命令 |
-| 🔒 `日志 [名字] [行数]` / `console` | 读取 `latest.log` 尾部；默认 30 行，最多 200 行 |
-| 🔒 `重启 [名字]` / `restart` | 重启服务器实例但不关闭计时卡，并在重新就绪时通知 |
-| 🔒 `自动关停` | 查看所有服务器的自动关停设置和当前倒计时 |
-| 🔒 `自动关停 <名字> <分钟>` | 设置无人在线多久后关停；`0` 表示关闭 |
-| 🔒 `暂停自动关停 [分钟]` | 全局暂停，默认 60 分钟，同时取消当前倒计时 |
-| 🔒 `取消关停` / `保留` | 在 60 秒倒计时内阻止本次自动关停 |
-
-### 服务器与账号配置
-
-| 指令 | 说明 |
-|---|---|
-| 🔒 `添加账号` / `加账号` | 录入手机号和密码；密码加密保存 |
-| 🔒 `账号列表` | 查看打码手机号、绑定的服务器和面板认证方式 |
-| 🔒 `删除账号 <手机号>` | 删除账号并解除相关服务器绑定，需要确认 |
-| 🔒 `添加服务器` / `添加` | 5 步：名字、计时卡 ID、地址、实例 UUID、已有账号；token/clientid/session 自动获取 |
-| 🔒 `删除服务器 <名字>` | 删除服务器，需要回复“确认” |
-| 🔒 `修改服务器名字 [旧 [新]]` | 修改服务器标签 |
-| 🔒 `修改地址 [名字 [地址]]` | 修改玩家连接地址 |
-| 🔒 `修改uuid [名字 [实例 ID]]` | 修改或清空实例 ID；清空后退回只开计时卡模式 |
-| 🔒 `绑定账号 <服务器> <手机号>` | 改绑用于 JWT 续期和面板操作的账号 |
-| 🔒 `更新token <名字>` | 手动更新 JWT，仅用于自动续期失败时应急 |
-
-### 通用
-
-| 指令 | 说明 |
-|---|---|
-| `取消` | 中止当前多步交互 |
-| `帮助` / `help` | 显示机器人内置帮助 |
-
-> 聊天桥会处理允许群里的普通纯文本；匹配到的 bot 指令会被命令处理器拦截，不会作为聊天转发。多服务器场景下，一条 QQ 消息会发往每台已检测到玩家在线的服务器。
+- **One-command server start:** starts the time card and server instance, then notifies the group when the server is ready
+- **Two-way Minecraft ↔ QQ chat bridge:** relays in-game chat to QQ and sends ordinary QQ messages back to active servers with `tellraw`
+- **Real-time event feed:** watches the Pterodactyl console over WebSocket for joins, leaves, deaths, and advancements; falls back to polling `latest.log`
+- **Player linking and statistics:** links QQ users to Minecraft names, uses QQ display names, supports mentions, playtime leaderboards, and death leaderboards
+- **Status and administration:** player count, player list, latency, version, CPU, memory, disk, mods, plugins, logs, console commands, and instance restarts
+- **Smart background management:** idle shutdown, a cancellable 60-second countdown, temporary suspension, and automatic keepalive for servers not started for six days
+- **Resource alerts:** notifies administrators only after CPU or memory stays above a threshold, with sustained checks and cooldowns to avoid spam
+- **Multiple servers:** controls multiple instances from one bot; status queries can be aggregated while administrative actions target a specific server
+- **Automatic authentication:** renews expired time-card JWTs with Playwright; prefers long-lived panel Client API Keys and retains session authentication as a compatibility fallback
+- **Interactive setup in QQ:** administrators can add accounts and servers without editing the database or restarting the bot
+- **Encrypted persistence:** stores configuration and statistics in SQLite; encrypts tokens, passwords, Client API Keys, and session credentials with Fernet
+- **Role-based permissions:** regular users can start, stop, query, and use player features; administrators manage accounts, servers, and privileged operations
 
 ---
 
-## 无需指令的自动能力
+## Command reference
 
-| 能力 | 实际行为 |
+Commands have no prefix by default and can be sent directly in a QQ group. Commands marked 🔒 are limited to users in `ADMIN_USERS`. All other commands are still subject to `ALLOWED_GROUPS`, `ALLOWED_USERS`, and cooldown settings.
+
+The command names are Chinese because the bot is designed for Chinese QQ groups; English aliases are available for several common operations.
+
+### Everyday controls and queries
+
+| Command | Description |
 |---|---|
-| 开服就绪通知 | 实例启动后先等 20 秒，再每 5 秒 SLP 探测；首次可连接时广播地址和人数，最长等待 5 分钟 |
-| 实时事件监听 | 优先使用 Pterodactyl WebSocket；断开后由后台重连，关闭实时模式时按轮询周期读取 `latest.log` |
-| 上下线/死亡/成就 | 自动发到所有允许群；绑定玩家的死亡和成就会 @ 对应 QQ |
-| 在线时长和死亡统计 | 从服务端日志维护在线会话并写入 SQLite，服务器关闭或离线时自动结算 |
-| 双向聊天桥 | MC → QQ 解析标准聊天日志；QQ → MC 使用 `tellraw`，只向确认有玩家在线的服务器发送 |
-| 空闲自动关停 | 开服后有 5 分钟宽限；达到每服配置的空闲时长后先广播 60 秒倒计时，可取消 |
-| 自动保活 | 完整配置的服务器若约 6 天未启动，会自动开机运行约 5 分钟再关机，并全程播报 |
-| 资源告警 | CPU/内存连续超过配置阈值若干次才报警，重复告警受冷却时间限制并 @ 管理员 |
-| SLP 失败退避 | 后台探测连续失败按 30/60/120/300 秒退避；用户主动发送“在线”仍立即查询 |
-| 凭据自动恢复 | JWT 失效时自动登录刷新；面板 session 兼容模式失效时刷新一次；Client API Key 被撤销则明确报错 |
-| 更新公告 | 若部署方写入 `bot-data/.changelog_to_send`，bot 下次连接后会向允许群发送一次并删除该文件 |
+| `开服 [name]` / `开机` / `start` | Start the time card and instance. With multiple servers, omitting the name opens a selection prompt. A second message is sent when the server is ready. |
+| `关服 [name]` / `关机` / `stop` | Stop the time card. A confirmation is required by default. |
+| `确认关服` | Confirm your most recent stop request within five minutes. |
+| `在线 [name]` / `人数` / `状态` | Show players, latency, version, and address. Without a name, summarizes every server. |
+| `查服 [name]` / `info` | Show instance state, CPU, memory, disk, address, and mod/plugin counts. |
+| `服务器列表` / `列表` | List configured servers, time-card IDs, and connection addresses. |
+| `服务器地址 [name]` / `地址` | Show the connection address for one or all servers. |
+| `模组 [name]` / `mods` | List JAR files under `/mods`. |
+| `插件 [name]` / `plugins` | List JAR files under `/plugins`. |
+| `mc <Java player name>` / `皮肤` | Look up a Minecraft Java player and render a profile card. |
 
-> 完整的 MC → QQ 事件与聊天依赖服务器已配置实例 UUID、绑定账号并能读取标准格式的 `latest.log`。若整合包或聊天插件改写了日志格式，需要扩展日志正则。
+### Chat bridge and player statistics
+
+| Command or action | Description |
+|---|---|
+| Ordinary QQ group text | Relayed to every configured panel server where the bot has confirmed at least one online player. It appears in aqua as `[QQ] group nickname: message`. |
+| In-game chat | Relayed from the live console to every `ALLOWED_GROUPS` group. Linked players use their QQ group card or nickname. |
+| `绑定 <player>` | Link your QQ account to a Minecraft name for display names, mentions, and parameter-free statistics queries. |
+| `解绑` / `绑定列表` | Remove your own link or list all links. Administrators can use `绑定 <QQ> <player>` and `解绑 <QQ>` on behalf of another user. |
+| `今日榜` / `本周榜` | Show today's or the last seven days' playtime leaderboard, up to 15 players. |
+| `在线时长 [player]` | Show today's and seven-day playtime. Linked users may omit the player name. |
+| `死亡榜` | Show the all-time death leaderboard, up to 15 players. |
+| `死亡次数 [player]` | Show today's and all-time deaths. Linked users may omit the player name. |
+
+### Administrator operations
+
+| Command | Description |
+|---|---|
+| 🔒 `指令 [name] <MC command>` / `cmd` | Send a command to the Minecraft server console. |
+| 🔒 `日志 [name] [lines]` / `console` | Read the end of `latest.log`; defaults to 30 lines, maximum 200. |
+| 🔒 `重启 [name]` / `restart` | Restart the server instance without stopping its time card, then notify the group when it is ready again. |
+| 🔒 `自动关停` | Show idle-shutdown settings and active countdowns for all servers. |
+| 🔒 `自动关停 <name> <minutes>` | Shut a server down after the specified idle period; `0` disables it. |
+| 🔒 `暂停自动关停 [minutes]` | Globally suspend idle shutdown, defaulting to 60 minutes, and cancel active countdowns. |
+| 🔒 `取消关停` / `保留` | Cancel the current automatic shutdown during its 60-second countdown. |
+
+### Server and account configuration
+
+| Command | Description |
+|---|---|
+| 🔒 `添加账号` / `加账号` | Store a Minekuai phone number and password; the password is encrypted. |
+| 🔒 `账号列表` | Show masked phone numbers, linked servers, and panel authentication methods. |
+| 🔒 `删除账号 <phone>` | Delete an account and unlink its servers after confirmation. |
+| 🔒 `添加服务器` / `添加` | Five-step setup: name, time-card ID, address, instance UUID, and an existing account. Token, client ID, and session data are obtained automatically. |
+| 🔒 `删除服务器 <name>` | Delete a server after replying `确认` (confirm). |
+| 🔒 `修改服务器名字 [old [new]]` | Rename a server label. |
+| 🔒 `修改地址 [name [address]]` | Change a player connection address. |
+| 🔒 `修改uuid [name [instance ID]]` | Change or clear an instance ID. Clearing it returns to time-card-only mode. |
+| 🔒 `绑定账号 <server> <phone>` | Change the account used for JWT renewal and panel operations. |
+| 🔒 `更新token <name>` | Manually replace a JWT as an emergency fallback when automatic renewal fails. |
+
+### General
+
+| Command | Description |
+|---|---|
+| `取消` | Cancel the current multi-step interaction. |
+| `帮助` / `help` | Show the built-in help message. |
+
+> The chat bridge processes ordinary plain text in allowed groups. Recognized bot commands are intercepted by command handlers and are never relayed as chat. With multiple servers, one QQ message is sent to every server where online players have been detected.
 
 ---
 
-## 系统架构
+## Automatic capabilities
 
-```
-QQ 群消息
+| Capability | Behavior |
+|---|---|
+| Ready notification | Waits 20 seconds after starting an instance, then probes with Minecraft SLP every five seconds. It broadcasts the address and player count as soon as the server is reachable, for up to five minutes. |
+| Real-time event listener | Prefers the Pterodactyl WebSocket and reconnects in the background. When real-time mode is disabled, polls `latest.log`. |
+| Join, leave, death, and advancement events | Broadcasts events to every allowed group. Deaths and advancements mention the linked QQ user. |
+| Playtime and death statistics | Maintains player sessions from server logs, persists them in SQLite, and settles sessions when a server stops or becomes unreachable. |
+| Two-way chat bridge | Parses standard chat logs for MC → QQ. QQ → MC uses `tellraw` and only targets servers with confirmed online players. |
+| Idle shutdown | Includes a five-minute grace period after start. When the configured idle period is reached, broadcasts a cancellable 60-second countdown. |
+| Automatic keepalive | If a fully configured server has not started for about six days, starts it, keeps it running for about five minutes, then stops it, announcing each stage. |
+| Resource alerts | Requires CPU or memory to remain above its threshold for several checks before alerting; repeat alerts are rate-limited and mention administrators. |
+| SLP failure backoff | Background probes back off for 30, 60, 120, then 300 seconds after repeated failures. An explicit `在线` query still runs immediately. |
+| Credential recovery | Automatically signs in to renew an expired JWT. Refreshes a compatibility panel session once after a 401/419. Reports a revoked Client API Key explicitly. |
+| Update announcement | If the operator creates `bot-data/.changelog_to_send`, the bot sends its contents once after connecting and then removes the file. |
+
+> Complete MC → QQ event and chat support requires an instance UUID, a linked account, and access to a standard-format `latest.log`. Modpacks or chat plugins that rewrite log lines may require additional regular expressions.
+
+---
+
+## Architecture
+
+```text
+QQ group message
    │
    ▼
-NapCatQQ（QQ 协议端，挂机器人小号）
-   │  OneBot v11 反向 WebSocket
+NapCatQQ (QQ protocol client running a dedicated bot account)
+   │  OneBot v11 reverse WebSocket
    ▼
-nonebot2 + minekuai 插件（业务逻辑）
+nonebot2 + Minekuai plugin (application logic)
    │
-   ├─ 第 1 步：开计时卡
+   ├─ Step 1: start the time card
    │    HTTPS + JWT Bearer
    │    api.minekuai.com/system/timeBalance/...
    │       │
-   │       ├─ 401 → 服务器绑了账号？
-   │       │       ↓ 是
-   │       │      Playwright 无头 Chromium 登录 minekuai.com
-   │       │      → 拿到新 JWT + clientid（并保留兼容 cookies）
-   │       │      → 写回 DB → 重试
+   │       ├─ 401 → is an account linked to this server?
+   │       │       ↓ yes
+   │       │      Playwright signs in to minekuai.com with headless Chromium
+   │       │      → obtains a new JWT + client ID (and compatibility cookies)
+   │       │      → writes them to the database → retries
    │       │
-   │       └─ 200 → 计时卡开启成功
+   │       └─ 200 → time card started
    │
-   └─ 第 2 步：启动服务器实例（如果配了 uuid + 账号）
-        HTTPS + Pterodactyl Client API Key（Authorization: Bearer ptlc_...）
+   └─ Step 2: start the instance (when UUID + account are configured)
+        HTTPS + Pterodactyl Client API Key (Authorization: Bearer ptlc_...)
         POST minekuai.com/api/client/servers/<id>/power {"signal":"start"}
            │
-           ├─ API Key 未配置 → 兼容 session cookies + X-XSRF-TOKEN
+           ├─ no API Key → compatibility session cookies + X-XSRF-TOKEN
            │
-           └─ 204 → 启动信号下达，30-60 秒后服务器可进
+           └─ 204 → start signal accepted; server is usually ready in 30–60 seconds
 
            SQLite (bot-data/operation_log.db)
-           ├── servers 表       — 服务器配置（card_id / instance_uuid / 绑定账号）
-           ├── accounts 表      — 手机号 / 密码 / 加密的 Client API Key / 兼容 session
-           └── operation_log 表 — 谁在何时操作了什么
+           ├── servers       — server settings (card ID / instance UUID / linked account)
+           ├── accounts      — phone / password / encrypted Client API Key / compatibility session
+           └── operation_log — who performed each operation and when
 ```
 
-两个进程跑在一台机器上，都是 Docker 容器，由 [docker-compose.yml](docker-compose.yml) 编排：
+Both processes run on the same machine as Docker containers orchestrated by [docker-compose.yml](docker-compose.yml):
 
-| 容器 | 镜像 | 作用 |
+| Container | Image | Purpose |
 |---|---|---|
-| `napcat` | `mlikiowa/napcat-docker:latest` | 挂 QQ 账号，把 QQ 消息翻译成 OneBot v11 协议 |
-| `minekuai-bot` | 本地构建（[bot/Dockerfile](bot/Dockerfile)），含 Chromium | nonebot2 主程序 + Playwright |
+| `napcat` | `mlikiowa/napcat-docker:latest` | Runs the QQ account and translates QQ messages to OneBot v11. |
+| `minekuai-bot` | Locally built from [bot/Dockerfile](bot/Dockerfile), including Chromium | Runs nonebot2, the application plugin, and Playwright. |
 
-镜像约 **1.88 GB**（Chromium 占大头）。`network_mode: host` 让 napcat ↔ bot 走 `127.0.0.1:8080`，免去 Docker DNS 复杂度。
+The image is about **1.88 GB**, largely due to Chromium. `network_mode: host` lets NapCat and the bot communicate through `127.0.0.1:8080` without Docker DNS configuration.
 
 ---
 
-## 目录结构
+## Project layout
 
-```
+```text
 minekuai-qqbot/
-├── docker-compose.yml          # napcat + bot 编排
+├── docker-compose.yml          # NapCat + bot orchestration
 ├── docs/
-│   ├── SETUP.md                # 非 Docker 开发部署
-│   └── DEPLOY-LINUX.md         # Linux 服务器 Docker 部署补充
+│   ├── SETUP.md                # non-Docker development deployment
+│   └── DEPLOY-LINUX.md         # additional Linux Docker deployment notes
 ├── deploy/
-│   └── minekuai-bot.service    # systemd 单元（不用 docker-compose 时备用）
+│   └── minekuai-bot.service    # optional systemd unit without Compose
 └── bot/
-    ├── Dockerfile              # bot 镜像（含 Python + Playwright + Chromium）
-    ├── bot.py                  # nonebot 入口
-    ├── pyproject.toml          # Python 依赖
-    ├── .env.example            # 配置模板
+    ├── Dockerfile              # Python + Playwright + Chromium image
+    ├── bot.py                  # nonebot entry point
+    ├── pyproject.toml          # Python dependencies
+    ├── .env.example            # configuration template
     └── plugins/minekuai/
-        ├── __init__.py         # 指令注册 + 业务流程 + 自动续期重试逻辑
-        ├── client.py           # MinekuaiClient (计时卡) + PanelClient (实例)
-        ├── auth.py             # Playwright 自动登录（捕获 token + cookies）
-        ├── config.py           # 配置 schema
-        ├── servers.py          # SQLite 数据层：servers + accounts
-        ├── permission.py       # 白名单 + 冷却 + 待确认状态
-        └── audit.py            # 操作日志
+        ├── __init__.py         # commands, workflows, and authentication retries
+        ├── client.py           # MinekuaiClient (time card) + PanelClient (instance)
+        ├── auth.py             # Playwright sign-in and token/cookie capture
+        ├── config.py           # configuration schema
+        ├── servers.py          # SQLite storage for servers and accounts
+        ├── permission.py       # allowlists, cooldowns, and confirmations
+        └── audit.py            # operation log
 ```
 
 ---
 
-## 快速开始（Linux + Docker）
+## Quick start (Linux + Docker)
 
-要求：Docker 28+ / Docker Compose v2 / 能访问外网 / 至少 1GB 空闲内存（Chromium 跑起来用得多）。
+Requirements: Docker 28+, Docker Compose v2, internet access, and at least 1 GB of free memory. Chromium is the largest runtime consumer.
 
-### 1. 克隆 + 进目录
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/LookO-666/minekuai-qqbot.git
 cd minekuai-qqbot
 ```
 
-### 2. 全局配置（白名单等）
+### 2. Configure global permissions
 
 ```bash
 cp bot/.env.example bot/.env
@@ -210,153 +214,151 @@ chmod 600 bot/.env
 nano bot/.env
 ```
 
-只用填权限字段：
+Only the permission-related fields are required initially:
 
-| 字段 | 含义 |
+| Field | Meaning |
 |---|---|
-| `ALLOWED_GROUPS` | 你的 QQ 群号列表，如 `[123456789]`（必填） |
-| `ALLOWED_USERS` | 允许的 QQ 号列表，留空 `[]` = 群内所有人都能用 |
-| `ADMIN_USERS` | 管理员 QQ 号列表；留空时管理指令默认拒绝 |
-| `CREDENTIAL_ENCRYPTION_KEY` | SQLite 敏感凭据加密密钥（必填，生成后妥善备份） |
-| `COMMAND_COOLDOWN` | 同一用户的指令冷却（秒），默认 5 |
-| `STOP_NEED_CONFIRM` | 关服是否需要二次确认，默认 `true` |
+| `ALLOWED_GROUPS` | QQ group IDs, for example `[123456789]` (required). |
+| `ALLOWED_USERS` | Allowed QQ user IDs. Leave as `[]` to allow every member of an allowed group. |
+| `ADMIN_USERS` | Administrator QQ user IDs. Administrative commands are denied when empty. |
+| `CREDENTIAL_ENCRYPTION_KEY` | Fernet key used to encrypt sensitive SQLite fields (required; back it up securely). |
+| `COMMAND_COOLDOWN` | Per-user command cooldown in seconds; defaults to 5. |
+| `STOP_NEED_CONFIRM` | Whether stopping a server requires confirmation; defaults to `true`. |
 
-> **服务器/账号配置一律不用预先写 `.env`**——bot 启动后由 `ADMIN_USERS` 中的管理员在 QQ 群里发 `添加服务器` / `添加账号` 全交互式完成。
+> **Do not preconfigure servers or accounts in `.env`.** After the bot starts, an `ADMIN_USERS` administrator can complete setup interactively with `添加账号` and `添加服务器` in QQ.
 >
-> 生成密钥：`python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`。密钥丢失后已加密凭据无法恢复，请和数据库备份分开保管。
+> Generate a key with `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Existing encrypted credentials cannot be recovered if the key is lost. Store key and database backups separately.
 
-### 3. 拉起 napcat + 扫码登录 QQ
+### 3. Start NapCat and sign in to QQ
 
 ```bash
 docker compose up -d napcat
 docker compose logs napcat | grep -iE "webui|token"
 ```
 
-会看到一行：
+The logs will include a line similar to:
 
-```
+```text
 [NapCat] [WebUi] WebUi User Panel Url: http://127.0.0.1:6099/webui?token=xxxxxxxx
 ```
 
-> ⚠️ **URL 末尾必须带斜杠**：`http://127.0.0.1:6099/webui/?token=xxx`，不然 301 跳转会让某些浏览器卡住。
+> ⚠️ **Add a trailing slash to the URL:** use `http://127.0.0.1:6099/webui/?token=xxx`. Without it, a 301 redirect can hang in some browsers.
 
-**SSH 用户**：服务器没图形界面，在本地电脑新开终端做端口转发：
+If the server is accessed over SSH, open another terminal on your local computer and forward the port:
 
 ```bash
 ssh -L 6099:127.0.0.1:6099 user@your-server
 ```
 
-本地浏览器打开 WebUI 链接后两步：
+Open the WebUI locally and complete two steps:
 
-1. **登录 QQ**：扫码登录机器人小号（不要主号）
-2. **网络配置 → 新建 → WebSocket 客户端**：
+1. **Sign in to QQ:** scan the QR code with a dedicated bot account, not your primary account.
+2. **Network Configuration → New → WebSocket Client:**
 
-   | 字段 | 值 |
+   | Field | Value |
    |---|---|
-   | 名称 | `bot` |
+   | Name | `bot` |
    | URL | `ws://127.0.0.1:8080/onebot/v11/ws` |
-   | Token | 留空 |
-   | 消息格式 | `array` |
-   | 启用 | ✅ |
-   | 心跳间隔 | `30000` |
+   | Token | Leave empty |
+   | Message format | `array` |
+   | Enabled | ✅ |
+   | Heartbeat interval | `30000` |
 
-### 4. 拉起机器人
+### 4. Start the bot
 
 ```bash
 docker compose up -d --build bot
 docker compose logs -f bot
 ```
 
-镜像首次构建要 **5-15 分钟**（pip 装 Playwright + 下载 Chromium 约 150MB）。后续修改代码重建只要几秒。
+The first build takes approximately **5–15 minutes** because pip installs Playwright and downloads about 150 MB of Chromium files. Subsequent source-only rebuilds are much faster.
 
-成功标志：
+Successful startup looks like:
 
-```
+```text
 [INFO] uvicorn | Uvicorn running on http://127.0.0.1:8080
 [INFO] uvicorn | "WebSocket /onebot/v11/ws" [accepted]
 [INFO] nonebot | OneBot V11 | Bot xxxxxxxxxx connected
 ```
 
-### 5. 在 QQ 群里加账号 + 加服务器
+### 5. Add an account and server in QQ
 
-把机器人加到配好的 QQ 群里。
+Invite the bot to a group listed in `ALLOWED_GROUPS`.
 
-**先加账号**（用于自动续期 + 实例启动）：
+First add an account for automatic renewal and instance control:
 
-```
+```text
 添加账号
 ```
 
-bot 会问 2 个问题：手机号（minekuai 登录用的）+ 密码。密码、token 和会话凭据会使用 `CREDENTIAL_ENCRYPTION_KEY` 加密后写入本机 SQLite；旧版明文数据会在启动时自动、幂等迁移。
+The bot asks for the Minekuai phone number and password. Passwords, tokens, API Keys, and session credentials are encrypted with `CREDENTIAL_ENCRYPTION_KEY` before being stored in the local SQLite database. Legacy plaintext records are migrated automatically and idempotently at startup.
 
-**再加服务器**：
+Then add a server:
 
-```
+```text
 添加服务器
 ```
 
-6 步交互式询问。其中：
+The five prompts request:
 
-- **计时卡 ID**：F12 → 任意 `api.minekuai.com/system/timeBalance/.../startTiming/XXX` 那串纯数字
-- **token / clientid**：F12 → 任意 `api.minekuai.com` 请求的 Request Headers 里
-- **实例 ID**：浏览器控制台 URL `minekuai.com/server/XXX` 里的 XXX（如 `420d4426`）
+- **Name:** the label used in bot commands, such as `GTNH`
+- **Time-card ID:** the numeric suffix of an `api.minekuai.com/system/timeBalance/.../startTiming/XXX` request
+- **Address:** the Minecraft address shown in the Minekuai console
+- **Instance ID:** the value in `minekuai.com/server/XXX`, such as `420d4426`
+- **Account:** choose an account already added to the bot; token, client ID, and panel authentication are obtained automatically
 
-**最后绑账号**：
+Now send:
 
-```
-绑定账号 GTNH 13xxxxxxxx
-```
-
-群里发：
-
-```
+```text
 开服 GTNH
 ```
 
-当前部署的绑定账号已配置 Client API Key，开服时直接走 Bearer 鉴权，通常 2-3 秒即可下达实例启动信号。Playwright 仅在计时卡 JWT 失效时用于自动续期。
+When the linked account has a Client API Key, panel control uses Bearer authentication and normally sends the instance start signal within two or three seconds. Playwright is only needed when the time-card JWT expires.
 
 ---
 
-## token / clientid / 计时卡 ID / 实例 ID 怎么抓
+## Finding the token, client ID, time-card ID, and instance ID
 
-1. 浏览器登录 https://minekuai.com
-2. 进想要控制的服务器控制台页面（URL 形如 `minekuai.com/server/420d4426`）
-3. F12 → **Network**（网络）标签
-4. 点页面上的"启动"或"关闭"按钮（让网络面板出现请求）
-5. 找需要的字段：
+Most new deployments only need the time-card ID and instance ID during interactive setup; token and client ID are obtained automatically. To inspect or recover them manually:
 
-| 字段 | 怎么找 |
+1. Sign in at <https://minekuai.com>.
+2. Open the target server console, whose URL resembles `minekuai.com/server/420d4426`.
+3. Open browser developer tools and select **Network**.
+4. Click **Start** or **Stop** on the page to create requests.
+5. Find the relevant value:
+
+| Field | Where to find it |
 |---|---|
-| `token` | 任意 `api.minekuai.com` 请求 → Request Headers → `authorization: Bearer eyJ...`（bot 会自动去掉 `Bearer ` 前缀） |
-| `clientid` | 同上请求 Headers 里的 `clientid` 字段 |
-| `计时卡 ID` | URL 含 `startTiming` 或 `stopTiming` 的请求，URL 末尾的纯数字 |
-| `实例 ID` | 浏览器地址栏 `minekuai.com/server/XXX` 中的 XXX，或任意 `/api/client/servers/XXX/...` 请求的 XXX |
-| `地址` | 网页控制台右上角显示（玩家用的 IP:端口） |
+| `token` | Any `api.minekuai.com` request → Request Headers → `authorization: Bearer eyJ...`. The bot removes the `Bearer ` prefix automatically. |
+| `clientid` | The `clientid` header in the same request. |
+| Time-card ID | The numeric suffix of a request URL containing `startTiming` or `stopTiming`. |
+| Instance ID | The `XXX` in `minekuai.com/server/XXX`, or in `/api/client/servers/XXX/...`. |
+| Address | The player-facing host and port shown in the web console. |
 
-> token 失效之后**有自动续期，平时不用管**。需要的话用 `更新token <名字>` 手动重粘。
+Expired tokens are normally renewed automatically. Use `更新token <name>` only as a manual fallback.
 
 ---
 
-## 日常运维
+## Operations
 
 ```bash
-docker compose ps                              # 容器状态
-docker compose logs -f bot                     # 机器人日志
-docker compose logs -f napcat                  # QQ 协议端日志
-docker compose restart bot                     # 改了 .env 后只重启 bot
-docker compose down && docker compose up -d    # 全部重起
+docker compose ps                              # container status
+docker compose logs -f bot                     # bot logs
+docker compose logs -f napcat                  # QQ protocol client logs
+docker compose restart bot                     # restart after changing .env
+docker compose down && docker compose up -d    # restart the complete stack
 ```
 
-服务器开机后自动恢复（`restart: unless-stopped` + Docker 自启）。
+Containers recover after a host reboot through `restart: unless-stopped` and Docker's startup service.
 
-### 查看操作日志
+### Inspect the operation log
 
 ```bash
 sqlite3 bot-data/operation_log.db \
   "SELECT ts, user_name, command, success, detail FROM operation_log ORDER BY id DESC LIMIT 20;"
 ```
 
-### 查看已配置的服务器 + 账号
+### Inspect configured servers and accounts
 
 ```bash
 sqlite3 bot-data/operation_log.db \
@@ -365,146 +367,150 @@ sqlite3 bot-data/operation_log.db \
   "SELECT phone, length(panel_api_key), last_refresh_at FROM accounts;"
 ```
 
-> 直接群里 `服务器列表` / `账号列表` 更方便。
+Using `服务器列表` and `账号列表` in QQ is usually more convenient.
 
-### 自动续期失败时
+### When automatic renewal fails
 
-如果某次 `开服` 报：
+If `开服` reports:
 
+```text
+❌ token expired and automatic renewal also failed: xxx
 ```
-❌ token 失效，自动续期也失败：xxx
-```
 
-可能原因：
-- 账号密码错了 → `删除账号 <手机号>` + `添加账号` 重输
-- minekuai 改了登录页 UI → 我（bot 作者）需要调 Playwright 选择器
-- 触发了风控（滑块 / 验证码） → 暂时只能 `更新token <名字>` 手动应急
+Possible causes:
 
-### 实例启动失败时
+- The account password is wrong: run `删除账号 <phone>` and add it again with `添加账号`.
+- Minekuai changed its sign-in UI: the Playwright selectors need to be updated.
+- A risk-control challenge, slider, or CAPTCHA was triggered: use `更新token <name>` as a temporary manual fallback.
 
-报 `实例启动失败: xxx`：
-- `xxx` 是 `面板 API Key 已失效或被撤销` → 到 `https://minekuai.com/account/api` 重新创建 Client API Key
-- 未配置 API Key 时仍会回退到 session；session 的 `401/419` 会自动刷新一次
-- 其他错误 → 看 docker logs 里 `panel POST power` 那行的具体响应
+### When instance startup fails
+
+If the bot reports `instance startup failed: xxx`:
+
+- If `xxx` says the panel API Key is invalid or revoked, create a new Client API Key at <https://minekuai.com/account/api>.
+- Accounts without an API Key fall back to a session; a session 401/419 triggers one automatic refresh.
+- For other errors, inspect the `panel POST power` response in the Docker logs.
 
 ---
 
-## 配置详解（bot/.env）
+## Configuration reference (`bot/.env`)
 
 ```ini
-# ===== nonebot 基础 =====
+# ===== nonebot basics =====
 HOST=127.0.0.1
-PORT=8080                                # 改这里也要同步改 napcat WS 客户端 URL
-LOG_LEVEL=INFO                           # DEBUG 看详细 HTTP 日志
+PORT=8080                                # also update the NapCat WS client URL
+LOG_LEVEL=INFO                           # DEBUG enables detailed HTTP logs
 ONEBOT_WS_URLS=["ws://127.0.0.1:8080/onebot/v11/ws"]
-COMMAND_START=[""]                       # 空=直接发『开服』触发；填 "/" 要 "/开服"
+COMMAND_START=[""]                       # empty: send 开服; use ["/"] to require /开服
 
-# ===== 麦块联机（兼容字段，新部署可全留空） =====
-# 启动时若数据库为空 + 这三个都填了，会自动导入为名为『default』的服务器
-# 之后请用『添加服务器』等指令管理；这些字段会被忽略
+# ===== Minekuai legacy compatibility =====
+# If the database is empty and all three are set, they are imported as "default".
+# Manage servers with 添加服务器 afterward; these values are then ignored.
 MINEKUAI_TOKEN=
 MINEKUAI_CLIENT_ID=
 MINEKUAI_CARD_ID=
 
-# ===== 权限 =====
-ALLOWED_GROUPS=[群号1, 群号2]              # 哪些群能用，空=不限群（不推荐）
-ALLOWED_USERS=[]                          # 哪些 QQ 能用，空=群内所有人都能用
-ADMIN_USERS=[管理员QQ号]                   # 配置、账号、日志、重启等管理权限
-CREDENTIAL_ENCRYPTION_KEY=                 # Fernet 密钥；生成后不可随意更换
+# ===== permissions =====
+ALLOWED_GROUPS=[group_id_1, group_id_2]   # allowed groups; empty allows all (not recommended)
+ALLOWED_USERS=[]                          # allowed QQ users; empty allows all users in allowed groups
+ADMIN_USERS=[admin_qq_id]                 # server/account/log/restart administration
+CREDENTIAL_ENCRYPTION_KEY=                # Fernet key; do not change after data is encrypted
 
-# ===== 行为 =====
-COMMAND_COOLDOWN=5                        # 同一用户同一指令冷却（秒）
-STOP_NEED_CONFIRM=true                    # 关服是否需要二次确认
-POLL_INTERVAL_SECONDS=30                  # 后台状态/日志/资源轮询周期，最小 5 秒
+# ===== behavior =====
+COMMAND_COOLDOWN=5                        # per-user, per-command cooldown in seconds
+STOP_NEED_CONFIRM=true                    # require confirmation before stopping
+POLL_INTERVAL_SECONDS=30                  # status/log/resource polling; minimum 5 seconds
 
-# ===== 群服互通和事件播报 =====
-EVENT_BROADCAST=true                      # 事件与日志解析总开关
-BROADCAST_JOIN_LEAVE=true                 # 是否播报加入/离开
-REALTIME_CONSOLE=true                     # WebSocket 实时控制台；false=轮询日志
-CHAT_BRIDGE=true                          # 双向聊天桥总开关
-CHAT_MC_TO_QQ=true                        # 游戏聊天 → QQ 群
-CHAT_QQ_TO_MC=true                        # QQ 群普通文本 → 在线服务器
+# ===== chat bridge and event broadcast =====
+EVENT_BROADCAST=true                      # master switch for events and log parsing
+BROADCAST_JOIN_LEAVE=true                 # announce player joins and leaves
+REALTIME_CONSOLE=true                     # WebSocket console; false polls logs
+CHAT_BRIDGE=true                          # master switch for the two-way chat bridge
+CHAT_MC_TO_QQ=true                        # in-game chat → QQ groups
+CHAT_QQ_TO_MC=true                        # ordinary QQ text → active servers
 
-# ===== 资源告警 =====
+# ===== resource alerts =====
 RESOURCE_ALERT=true
-CPU_ALERT_PERCENT=95                      # 相对面板 CPU 配额；0=关闭 CPU 告警
-MEM_ALERT_PERCENT=92                      # 相对面板内存配额；0=关闭内存告警
-ALERT_SUSTAINED_TICKS=3                   # 连续超阈值多少轮才告警
-ALERT_COOLDOWN_MINUTES=30                 # 同类告警最短重复间隔
+CPU_ALERT_PERCENT=95                      # relative to panel CPU quota; 0 disables CPU alerts
+MEM_ALERT_PERCENT=92                      # relative to panel memory quota; 0 disables memory alerts
+ALERT_SUSTAINED_TICKS=3                   # consecutive checks above the threshold
+ALERT_COOLDOWN_MINUTES=30                 # minimum interval between equivalent alerts
 ```
 
 ---
 
-## 常见问题
+## Troubleshooting
 
-**Q: 群里发"开服"机器人没反应**
+**The bot does not respond to `开服`.**
 
-按这个顺序排查：
+Check in this order:
 
 ```bash
-# 1. 容器都活着吗？
+# 1. Are both containers running?
 docker compose ps
 
-# 2. NapCat 连上 nonebot 了吗？
+# 2. Is NapCat connected to nonebot?
 docker compose logs bot | grep -i "connected"
-# 应有 "OneBot V11 | Bot xxx connected"
+# Expect: "OneBot V11 | Bot xxx connected"
 
-# 3. QQ 在线吗？
+# 3. Is QQ online?
 docker compose logs napcat | tail -20
-# 找最后一条状态变更，应该是"上线"，不是"离线"
+# The latest status change should indicate online, not offline.
 
-# 4. 群号在白名单里吗？
+# 4. Is the group in the allowlist?
 grep ALLOWED_GROUPS bot/.env
 ```
 
-**Q: 开了计时卡但服务器实例没启动**
+**The time card starts, but the server instance does not.**
 
-通常两种原因：
-- **服务器没绑账号** → `绑定账号 GTNH <手机号>` 后重试
-- **服务器没填实例 ID** → `修改uuid GTNH <id>` 后重试
+The usual causes are:
 
-`服务器列表` 能看到当前每台的配置。
+- No linked account: run `绑定账号 GTNH <phone>` and retry.
+- No instance ID: run `修改uuid GTNH <id>` and retry.
 
-**Q: 报错 "操作太频繁，请稍后再试"**
+Use `服务器列表` to inspect the current configuration.
 
-计时卡刚被开/关过，后端限流。bot 识别这种情况后用 ℹ️ 而非 ❌ 显示（状态实际已经对了）。
+**The bot says the operation is too frequent.**
 
-**Q: 镜像构建很慢**
+The time card was just started or stopped and the backend is rate-limiting requests. The bot recognizes this state and reports it with ℹ️ rather than ❌ because the desired state has already been reached.
 
-Chromium 下载约 150MB。国内服务器最好挂个代理或者用国内 Docker 镜像源（见 [docs/DEPLOY-LINUX.md](docs/DEPLOY-LINUX.md)）。
+**The image builds slowly.**
 
-**Q: WebUI 打不开**
+Chromium is about 150 MB. A proxy or a local Docker mirror may help in regions with slow international connectivity; see [docs/DEPLOY-LINUX.md](docs/DEPLOY-LINUX.md).
 
-最常见三种：
-1. URL 末尾少了斜杠 → 用 `http://127.0.0.1:6099/webui/?token=xxx`
-2. SSH 远程没做端口转发 → 见上文第 3 步
-3. 防火墙 → 开 6099 或者只走 SSH 转发
+**NapCat WebUI does not open.**
 
-**Q: napcat 容器 Up 但 WebUI 端口没起来**
+Common causes:
 
-X11/Xvfb 的坑。`docker-compose.yml` 里有一段 `entrypoint:` 覆盖（创建 `/tmp/.X11-unix`，把 Xvfb 显示号从 `:1` 改成 `:99`），避开 `network_mode: host` 下宿主机已占用 `:1` 显示号的冲突。如果换镜像后又起不来，先看 `docker compose logs napcat` 里有没有 `Missing X server`、`server already running` 这类报错。
+1. The URL is missing its trailing slash. Use `http://127.0.0.1:6099/webui/?token=xxx`.
+2. A remote SSH server needs the port forwarding described in Quick Start step 3.
+3. A firewall is blocking port 6099; allow it temporarily or use SSH forwarding only.
 
-**Q: 聊天桥或玩家事件没有转发**
+**The NapCat container is running, but its WebUI port is unavailable.**
 
-按下面顺序检查：
+This is usually an X11/Xvfb conflict. The `entrypoint` override in `docker-compose.yml` creates `/tmp/.X11-unix` and moves Xvfb from display `:1` to `:99`, avoiding a host display collision under `network_mode: host`. After changing images, inspect `docker compose logs napcat` for messages such as `Missing X server` or `server already running`.
 
-1. 服务器已经填写实例 UUID 并绑定账号，面板 Client API Key 可用；
-2. `EVENT_BROADCAST=true`、`CHAT_BRIDGE=true`，对应方向的 `CHAT_MC_TO_QQ` / `CHAT_QQ_TO_MC` 也为 `true`；
-3. 日志里能看到 `[ws] <服务器名> 实时控制台已连接`，或关闭实时模式后能读取 `/logs/latest.log`；
-4. 服务端使用标准英文加入、离开、死亡、成就和 `<玩家> 内容` 聊天日志格式；
-5. QQ → MC 只在 bot 已从日志确认至少一名玩家在线时转发。
+**The chat bridge or player events are not forwarded.**
 
-多服务器时，QQ 普通消息会转到每台在线服务器；MC 消息和事件会广播到所有 `ALLOWED_GROUPS`。如不希望群内普通聊天进服，设置 `CHAT_QQ_TO_MC=false`。
+Check the following:
 
-**Q: 我有多台服务器**
+1. The server has an instance UUID and linked account, and its panel Client API Key works.
+2. `EVENT_BROADCAST=true`, `CHAT_BRIDGE=true`, and the relevant `CHAT_MC_TO_QQ` or `CHAT_QQ_TO_MC` direction is enabled.
+3. Logs show `[ws] <server> real-time console connected`, or `latest.log` is readable when real-time mode is disabled.
+4. The server emits standard English join, leave, death, advancement, and `<player> message` chat lines.
+5. QQ → MC only relays after the bot has confirmed at least one player online from server logs.
 
-直接 `添加服务器` 加几台，起不同名字（如 `GTNH` / `原版`）。每台都可以独立绑账号、配 UUID。`开服 GTNH` / `开服 原版` 分别操作。
+With multiple servers, ordinary QQ messages go to every active server, while MC messages and events are broadcast to all `ALLOWED_GROUPS`. Set `CHAT_QQ_TO_MC=false` if ordinary group chat should never enter the game.
+
+**I have multiple servers.**
+
+Run `添加服务器` more than once and assign distinct names such as `GTNH` and `Vanilla`. Each server can use its own account and UUID. Operate them independently with commands such as `开服 GTNH` and `开服 Vanilla`.
 
 ---
 
-## 开发与测试
+## Development and testing
 
-非 Docker 开发环境除主依赖外还需安装 `bot/requirements-security.txt`。提交或部署前运行隔离测试目标：
+A non-Docker development environment requires `bot/requirements-security.txt` in addition to the main dependencies. Run the isolated test target before submitting or deploying changes:
 
 ```bash
 docker compose --profile test run --rm test
@@ -512,81 +518,83 @@ docker compose --profile test run --rm test
 
 ---
 
-## 安全建议
+## Security recommendations
 
-1. **机器人 QQ 用小号**：万一被风控不影响主号
-2. **QQ 小号别在其它地方登录**：协议端会被踢导致 bot 静默失效
-3. **WebUI 端口（6099）登录后关掉**：日常不需要外露
+1. **Use a secondary QQ account for the bot.** Risk controls should not affect your primary account.
+2. **Do not sign that QQ account in elsewhere.** Another client may disconnect the protocol session silently.
+3. **Close port 6099 after WebUI setup.** It is not needed during normal operation.
    ```bash
    sudo ufw deny 6099/tcp
    ```
-4. **`bot/.env` 文件权限收紧**：`chmod 600 bot/.env`
-5. **备份加密密钥**：`CREDENTIAL_ENCRYPTION_KEY` 不要提交到 Git，也不要在已有数据时随意更换；密钥丢失将无法解密凭据
-6. **minekuai 密码仍建议独立使用**：数据库已加密，但独立强密码能降低主机或备份泄露后的连带风险
-7. **定期备份 SQLite**：
+4. **Restrict `bot/.env` permissions:** run `chmod 600 bot/.env`.
+5. **Back up `CREDENTIAL_ENCRYPTION_KEY`.** Never commit it, and do not change it after storing encrypted data. Losing it makes credentials unrecoverable.
+6. **Use a unique, strong Minekuai password.** Database encryption reduces exposure but does not eliminate host or backup compromise risks.
+7. **Back up SQLite regularly:**
    ```bash
    cp bot-data/operation_log.db bot-data/operation_log.db.$(date +%F).bak
    ```
 
----
-
-## 文档
-
-- [docs/SETUP.md](docs/SETUP.md) — 非 Docker 开发部署
-- [docs/DEPLOY-LINUX.md](docs/DEPLOY-LINUX.md) — Linux 服务器 Docker 部署补充
+Never commit `.env`, the SQLite database, tokens, cookies, phone numbers, passwords, QQ/group IDs, or Client API Keys. If credentials are exposed, revoke them and rewrite Git history before publishing the repository.
 
 ---
 
-## 技术栈
+## Documentation
 
-- [nonebot2](https://nonebot.dev/) — 异步 QQ/IM 机器人框架
-- [NapCatQQ](https://github.com/NapNeko/NapCatQQ) — QQ NT 协议端，OneBot v11 接口
-- [Playwright](https://playwright.dev/) — 计时卡 JWT 失效时自动登录续期
-- [httpx](https://www.python-httpx.org/) — 异步 HTTP 客户端
-- [websockets](https://websockets.readthedocs.io/) — Pterodactyl 实时控制台和 MC → QQ 事件流
-- [mcstatus](https://github.com/py-mine/mcstatus) — Minecraft SLP 在线状态、玩家和延迟查询
-- [Pillow](https://python-pillow.org/) — 正版玩家资料图片卡渲染
-- [pydantic](https://docs.pydantic.dev/) — 配置 schema 校验
-- [SQLite](https://www.sqlite.org/) — 配置 + 账号 + 操作日志
-- [cryptography](https://cryptography.io/) — Fernet 敏感凭据加密
+- [docs/SETUP.md](docs/SETUP.md) — non-Docker development deployment
+- [docs/DEPLOY-LINUX.md](docs/DEPLOY-LINUX.md) — additional Linux Docker deployment notes
 
 ---
 
-## 更新历史
+## Technology stack
 
-### v4 (current) — Client API Key 面板鉴权
-
-- 面板控制优先使用账户页生成的 Pterodactyl Client API Key
-- API Key Fernet 加密存入 SQLite，不打印、不提交 Git
-- 保留 session cookies 作为未配置 API Key 时的兼容回退
-- 计时卡仍使用 `api.minekuai.com` JWT，失效时由 Playwright 自动续期
-
-### v3 — 全自动开服
-
-- 加 **Playwright 无头 Chromium 自动登录**：JWT token 失效时用账号密码自动刷新，群友无感
-- 加 **Pterodactyl 面板 cookies 管理**：调 `power` 端点用的 session 同步自动续期
-- 加 **实例自动启动**：开计时卡之后直接 `POST /api/client/servers/<id>/power {"signal":"start"}`，30-60 秒玩家就能进
-- 新指令：`添加账号` / `账号列表` / `删除账号` / `绑定账号` / `修改uuid`
-- DB 加 `accounts` 表 + `servers.instance_uuid` 列
-
-### v2 — 多服务器 + 聊天交互式配置
-
-- 一个 bot 同时控制多台
-- 群里指令 `添加服务器` / `删除服务器` / `修改服务器名字` / `修改地址` / `更新token`
-- 服务器配置从 `.env` 移到 SQLite
-- DB 加 `servers` 表
-
-### v1 — 单台 + 计时卡
-
-- 群里 `开服` / `关服` 调 `api.minekuai.com` 开关计时卡
-- 服务器实例启动还需要管理员手动到 minekuai.com 点
-- 配置全部在 `.env` 里
+- [nonebot2](https://nonebot.dev/) — asynchronous QQ/IM bot framework
+- [NapCatQQ](https://github.com/NapNeko/NapCatQQ) — QQ NT protocol client with a OneBot v11 interface
+- [Playwright](https://playwright.dev/) — automatic sign-in when a time-card JWT expires
+- [httpx](https://www.python-httpx.org/) — asynchronous HTTP client
+- [websockets](https://websockets.readthedocs.io/) — Pterodactyl console and MC → QQ event stream
+- [mcstatus](https://github.com/py-mine/mcstatus) — Minecraft SLP status, players, and latency
+- [Pillow](https://python-pillow.org/) — Minecraft profile card rendering
+- [pydantic](https://docs.pydantic.dev/) — configuration schema validation
+- [SQLite](https://www.sqlite.org/) — configuration, accounts, statistics, and operation logs
+- [cryptography](https://cryptography.io/) — Fernet encryption for sensitive credentials
 
 ---
 
-## 参与贡献
+## History
 
-欢迎提交 Issue 和 Pull Request。开始修改前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要在公开 Issue 中粘贴凭据。
+### v4 (current) — Client API Key panel authentication
+
+- Prefers a Pterodactyl Client API Key created from the Minekuai account page.
+- Encrypts API Keys with Fernet in SQLite and never prints or commits them.
+- Retains session cookies as a compatibility fallback when an API Key is not configured.
+- The time-card API still uses a JWT from `api.minekuai.com`, renewed by Playwright when necessary.
+
+### v3 — fully automated startup
+
+- Added headless Chromium sign-in with Playwright to renew expired JWTs transparently.
+- Added Pterodactyl panel cookie management with automatic session renewal.
+- Added automatic instance start after the time card: `POST /api/client/servers/<id>/power {"signal":"start"}`.
+- Added `添加账号`, `账号列表`, `删除账号`, `绑定账号`, and `修改uuid`.
+- Added the `accounts` table and `servers.instance_uuid` column.
+
+### v2 — multiple servers and interactive configuration
+
+- Added support for multiple servers in one bot.
+- Added `添加服务器`, `删除服务器`, `修改服务器名字`, `修改地址`, and `更新token`.
+- Moved server configuration from `.env` to SQLite.
+- Added the `servers` table.
+
+### v1 — one server and time-card control
+
+- Added `开服` and `关服` to control the time card through `api.minekuai.com`.
+- Starting the actual instance still required an administrator to use the Minekuai website.
+- Stored all configuration in `.env`.
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before making changes. Report security issues privately according to [SECURITY.md](SECURITY.md), and never paste credentials into a public issue.
 
 ---
 
@@ -596,7 +604,7 @@ docker compose --profile test run --rm test
 
 ---
 
-## 致谢
+## Credits
 
-- 本项目会调用麦块联机网页端及 Pterodactyl Client API；这些接口可能调整，若失效欢迎 PR 修正。
-- 原作者：[@klukeyuan](mailto:klukeyuan@gmail.com)
+- This project calls Minekuai web endpoints and the Pterodactyl Client API. These interfaces may change; fixes are welcome when they do.
+- Original author: [@klukeyuan](mailto:klukeyuan@gmail.com)
