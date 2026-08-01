@@ -4,6 +4,9 @@ services:
     container_name: napcat
     restart: unless-stopped
     network_mode: host
+    dns:
+    - 223.5.5.5
+    - 119.29.29.29
     entrypoint:
     - /bin/bash
     - -c
@@ -23,6 +26,9 @@ services:
     container_name: minekuai-bot
     restart: unless-stopped
     network_mode: host
+    dns:
+    - 223.5.5.5
+    - 119.29.29.29
     depends_on:
     - napcat
     env_file:
