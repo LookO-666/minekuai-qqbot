@@ -25,4 +25,5 @@ def test_extracts_base64_payload_from_data_uri():
 
 def test_image_code_error_recognizes_captcha_message():
     assert auth._is_image_code_error("图形验证码计算错误")
+    assert auth._is_image_code_error("Captcha invalid")
     assert not auth._is_image_code_error("短信发送过于频繁")

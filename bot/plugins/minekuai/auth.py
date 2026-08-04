@@ -379,9 +379,16 @@ def _extract_image_base64(src: str) -> str:
 
 
 def _is_image_code_error(message: str) -> bool:
+    text = message.lower()
     return any(
-        marker in message
-        for marker in ("图形验证码", "图片验证码", "计算结果", "验证码错误")
+        marker in text
+        for marker in (
+            "图形验证码",
+            "图片验证码",
+            "计算结果",
+            "验证码错误",
+            "captcha",
+        )
     )
 
 
