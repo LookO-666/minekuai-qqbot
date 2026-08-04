@@ -94,6 +94,8 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 | Command | Description |
 |---|---|
 | `取消` | Cancel the current multi-step interaction. |
+| `图形验证码 <answer>` | Answer the image arithmetic challenge when a Minekuai risk-control login asks for it. Only the user who started the login can answer. |
+| `短信验证码 <6 digits>` / `验证码 <6 digits>` | Continue the same login after the SMS code arrives. A private message to the bot is recommended. |
 | `帮助` / `help` | Show the built-in help message. |
 
 > The chat bridge processes ordinary plain text in allowed groups. Recognized bot commands are intercepted by command handlers and are never relayed as chat. With multiple servers, one QQ message is sent to every server where online players have been detected.
@@ -336,7 +338,7 @@ Most new deployments only need the time-card ID and instance ID during interacti
 | Instance ID | The `XXX` in `minekuai.com/server/XXX`, or in `/api/client/servers/XXX/...`. |
 | Address | The player-facing host and port shown in the web console. |
 
-Expired tokens are normally renewed automatically. Use `更新token <name>` only as a manual fallback.
+Expired tokens are normally renewed automatically. If Minekuai flags the login as an unusual location, the bot sends the image arithmetic challenge and then asks the original requester for the six-digit SMS code. Each answer expires after five minutes, is held only in memory, and is not written to the database or operation audit. Use `更新token <name>` only as a manual fallback.
 
 ---
 
@@ -382,7 +384,8 @@ Possible causes:
 
 - The account password is wrong: run `删除账号 <phone>` and add it again with `添加账号`.
 - Minekuai changed its sign-in UI: the Playwright selectors need to be updated.
-- A risk-control challenge, slider, or CAPTCHA was triggered: use `更新token <name>` as a temporary manual fallback.
+- An unusual-location login was triggered: follow the bot's `图形验证码` and `短信验证码` prompts. Only the original requester is accepted; replying in a private message is recommended.
+- Minekuai introduced a different challenge such as a slider: use `更新token <name>` as a temporary manual fallback.
 
 ### When instance startup fails
 

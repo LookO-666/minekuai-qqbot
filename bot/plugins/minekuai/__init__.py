@@ -56,6 +56,7 @@ token 失效时：如果服务器绑了账号，bot 会用 Playwright 自动登�
 没绑账号则提示用户『更新token <名字>』手动更新。
 """
 import asyncio
+import base64
 import re
 from pathlib import Path
 
@@ -75,7 +76,7 @@ from nonebot.params import ArgPlainText, CommandArg
 from nonebot.plugin import PluginMetadata
 from loguru import logger
 
-from . import auth, idle_watcher, mc_profile, servers
+from . import auth, idle_watcher, mc_profile, servers, verification
 from .audit import init_db as init_audit_db, log_operation
 from .client import (
     AuthError,
@@ -114,6 +115,8 @@ servers.maybe_migrate_from_env(
 
 
 CANCEL_WORDS = {"取消", "cancel", "Cancel", "CANCEL"}
+VERIFICATION_TIMEOUT_SECONDS = 5 * 60
+_verification_broker = verification.VerificationBroker()
 
 
 # ============================================================
@@ -380,7 +383,130 @@ def _mask_phone(phone: str) -> str:
     return phone[:3] + "****" + phone[-4:]
 
 
-async def _refresh_token_for(server: servers.Server) -> tuple[bool, str]:
+def _interactive_verification_provider(
+    matcher: Matcher,
+    event: MessageEvent,
+    phone: str,
+) -> auth.VerificationProvider:
+    """为当前操作创建只接受原用户回复的登录验证码提供器。"""
+    user_id = event.user_id
+    group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
+
+    async def provide(challenge: auth.LoginChallenge) -> str:
+        try:
+            request = _verification_broker.open(
+                user_id, group_id, challenge.kind
+            )
+        except verification.VerificationBusyError as e:
+            raise auth.LoginError("你已有一项同类登录验证正在等待输入") from e
+
+        try:
+            if challenge.kind == "image":
+                prompt = Message(
+                    f"🔐 账号 {_mask_phone(phone)} 触发了登录风控。\n"
+                    "请计算下图结果，然后由本次操作的发起人回复：\n"
+                    "图形验证码 <答案>\n"
+                    "建议私聊 Bot 发送；也可在当前群发送。5 分钟后超时。\n"
+                )
+                prompt += MessageSegment.image(
+                    base64.b64decode(challenge.image_base64)
+                )
+            else:
+                prompt = Message(
+                    f"📱 短信验证码已发送到 {_mask_phone(phone)}。\n"
+                    "请由本次操作的发起人回复：短信验证码 <6位数字>\n"
+                    "也可以简写为：验证码 <6位数字>\n"
+                    "建议私聊 Bot 发送；验证码不会写入数据库或操作审计。"
+                )
+            await matcher.send(prompt)
+        except Exception:
+            _verification_broker.close(request)
+            raise
+
+        try:
+            return await _verification_broker.wait(
+                request, VERIFICATION_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError as e:
+            label = "图片验证码" if challenge.kind == "image" else "短信验证码"
+            raise auth.LoginError(f"等待{label}超时，请重新执行原操作") from e
+        except verification.VerificationCancelledError as e:
+            raise auth.LoginError("登录验证已取消") from e
+
+    return provide
+
+
+async def _submit_login_verification(
+    matcher: Matcher,
+    event: MessageEvent,
+    kind: verification.ChallengeKind,
+    raw: str,
+) -> None:
+    value = raw.strip()
+    group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
+    label = "图形验证码" if kind == "image" else "短信验证码"
+
+    if value in CANCEL_WORDS:
+        if _verification_broker.cancel(event.user_id, group_id, kind):
+            await matcher.finish("已取消本次登录验证")
+        await matcher.finish(f"当前没有等待你输入的{label}")
+
+    pattern = r"-?\d{1,6}" if kind == "image" else r"\d{6}"
+    hint = "整数答案" if kind == "image" else "6 位数字"
+    if not re.fullmatch(pattern, value):
+        await matcher.finish(f"{label}格式不对，应为{hint}，请重新发送")
+
+    if not _verification_broker.submit(
+        event.user_id, group_id, kind, value
+    ):
+        await matcher.finish(
+            f"当前没有等待你输入的{label}，或同一账号有多项验证等待"
+        )
+    await matcher.finish(f"✅ 已收到{label}，正在继续登录…")
+
+
+image_verification_cmd = on_command(
+    "图形验证码",
+    aliases={"图片验证码"},
+    priority=1,
+    block=True,
+)
+
+
+@image_verification_cmd.handle()
+async def _image_verification(
+    matcher: Matcher,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+):
+    await _submit_login_verification(
+        matcher, event, "image", args.extract_plain_text()
+    )
+
+
+sms_verification_cmd = on_command(
+    "短信验证码",
+    aliases={"验证码"},
+    priority=1,
+    block=True,
+)
+
+
+@sms_verification_cmd.handle()
+async def _sms_verification(
+    matcher: Matcher,
+    event: MessageEvent,
+    args: Message = CommandArg(),
+):
+    await _submit_login_verification(
+        matcher, event, "sms", args.extract_plain_text()
+    )
+
+
+async def _refresh_token_for(
+    server: servers.Server,
+    verification_provider: auth.VerificationProvider | None = None,
+) -> tuple[bool, str]:
     """尝试用绑定账号刷新指定服务器的 token + 面板 cookies。
 
     一次登录搞定 4 样：token（JWT）/ clientid / session_cookie / xsrf_token。
@@ -395,7 +521,11 @@ async def _refresh_token_for(server: servers.Server) -> tuple[bool, str]:
 
     try:
         new_token, new_client_id, session_cookie, xsrf_token = (
-            await auth.refresh_token(account.phone, account.password)
+            await auth.refresh_token(
+                account.phone,
+                account.password,
+                verification_provider=verification_provider,
+            )
         )
     except auth.LoginError as e:
         return False, f"自动登录失败：{e}"
@@ -418,6 +548,7 @@ async def _refresh_token_for(server: servers.Server) -> tuple[bool, str]:
 
 async def _ensure_panel_auth(
     server: servers.Server,
+    verification_provider: auth.VerificationProvider | None = None,
 ) -> tuple[bool, str, servers.Server]:
     """确保账号有可用的面板 API Key 或兼容 session。
 
@@ -432,11 +563,12 @@ async def _ensure_panel_auth(
         return True, "已有 Client API Key", server
     if account.session_cookie and account.xsrf_token:
         return True, "使用兼容 session", server
-    ok, msg = await _refresh_token_for(server)
+    ok, msg = await _refresh_token_for(server, verification_provider)
     return ok, msg, servers.get_server(server.name) or server
 
 async def _start_instance(
     matcher: Matcher,
+    event: MessageEvent,
     server: servers.Server,
 ) -> tuple[bool, str]:
     """通过 panel POST /power signal=start 启动实例。
@@ -444,7 +576,12 @@ async def _start_instance(
     """
     if not server.instance_uuid:
         return False, "未配置 instance_uuid，跳过实例启动"
-    ok, msg, server = await _ensure_panel_auth(server)
+    verification_provider = _interactive_verification_provider(
+        matcher, event, server.account_phone or ""
+    )
+    ok, msg, server = await _ensure_panel_auth(
+        server, verification_provider
+    )
     if not ok:
         return False, msg
 
@@ -469,7 +606,7 @@ async def _start_instance(
                 f"⏳ 面板兼容 session 失效，正在用账号 "
                 f"{_mask_phone(server.account_phone)} 重新登录..."
             )
-            ok, msg = await _refresh_token_for(server)
+            ok, msg = await _refresh_token_for(server, verification_provider)
             if not ok:
                 return False, f"刷新失败：{msg}"
             continue
@@ -552,6 +689,9 @@ async def _start_step(
     user_id = event.user_id
     group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
     user_name = _user_display_name(event)
+    verification_provider = _interactive_verification_provider(
+        matcher, event, server.account_phone or ""
+    )
 
     # 若服务器还没有有效 token/clientid 但绑了账号，先自动登录补齐
     if (not server.token or not server.client_id) and server.account_phone:
@@ -559,7 +699,7 @@ async def _start_step(
             f"⏳ 『{server.name}』还没有 token，正在用账号 "
             f"{_mask_phone(server.account_phone)} 自动获取..."
         )
-        ok, msg = await _refresh_token_for(server)
+        ok, msg = await _refresh_token_for(server, verification_provider)
         if not ok:
             log_operation(
                 user_id, user_name, group_id,
@@ -593,7 +733,7 @@ async def _start_step(
                 # 计时卡刚开，给后端 2 秒同步
                 import asyncio as _asyncio
                 await _asyncio.sleep(2)
-                ok, msg = await _start_instance(matcher, server)
+                ok, msg = await _start_instance(matcher, event, server)
                 if ok:
                     instance_msg = " + 实例启动指令已下达"
                     instance_started = True
@@ -639,7 +779,9 @@ async def _start_step(
                     f"⏳ token 失效，正在用账号 "
                     f"{_mask_phone(server.account_phone)} 自动登录刷新..."
                 )
-                ok, msg = await _refresh_token_for(server)
+                ok, msg = await _refresh_token_for(
+                    server, verification_provider
+                )
                 if ok:
                     server = servers.get_server(server.name)
                     continue
@@ -777,6 +919,9 @@ async def _do_stop(
     group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
 
     await matcher.send(f"正在关闭『{server.name}』计时卡...")
+    verification_provider = _interactive_verification_provider(
+        matcher, event, server.account_phone or ""
+    )
 
     refresh_attempted = False
     while True:
@@ -797,7 +942,9 @@ async def _do_stop(
                     f"⏳ token 失效，正在用账号 "
                     f"{_mask_phone(server.account_phone)} 自动登录刷新..."
                 )
-                ok, msg = await _refresh_token_for(server)
+                ok, msg = await _refresh_token_for(
+                    server, verification_provider
+                )
                 if ok:
                     server = servers.get_server(server.name)
                     continue
@@ -1258,7 +1405,11 @@ async def _add_finish(
     )
     try:
         token, client_id, session_cookie, xsrf = await auth.refresh_token(
-            account.phone, account.password
+            account.phone,
+            account.password,
+            verification_provider=_interactive_verification_provider(
+                matcher, event, account.phone
+            ),
         )
     except auth.LoginError as e:
         log_operation(
@@ -2126,7 +2277,12 @@ async def _mc_cmd(
         )
 
     # 确保有 cookies
-    perm_ok, perm_msg, server = await _ensure_panel_auth(server)
+    verification_provider = _interactive_verification_provider(
+        matcher, event, server.account_phone
+    )
+    perm_ok, perm_msg, server = await _ensure_panel_auth(
+        server, verification_provider
+    )
     if not perm_ok:
         await matcher.finish(f"❌ 鉴权失败：{perm_msg}")
 
@@ -2161,7 +2317,7 @@ async def _mc_cmd(
                 f"⏳ 面板兼容 session 失效,用账号 "
                 f"{_mask_phone(server.account_phone)} 刷新中..."
             )
-            ok, msg = await _refresh_token_for(server)
+            ok, msg = await _refresh_token_for(server, verification_provider)
             if not ok:
                 await matcher.finish(f"❌ 刷新失败：{msg}")
             continue
@@ -2495,11 +2651,21 @@ def _fmt_mb(mb: float | int | None) -> str:
     return f"{mb}M" if mb < 1024 else f"{mb/1024:.1f}G"
 
 
-async def _with_panel_refresh(matcher: Matcher, server, fn):
+async def _with_panel_refresh(
+    matcher: Matcher,
+    event: MessageEvent,
+    server,
+    fn,
+):
     """调 PanelClient 操作；API Key 优先，兼容 session 可自动刷新。
     返回 (result | None, err_msg, server)。
     """
-    ok, msg, server = await _ensure_panel_auth(server)
+    verification_provider = _interactive_verification_provider(
+        matcher, event, server.account_phone or ""
+    )
+    ok, msg, server = await _ensure_panel_auth(
+        server, verification_provider
+    )
     if not ok:
         return None, msg, server
 
@@ -2522,7 +2688,7 @@ async def _with_panel_refresh(matcher: Matcher, server, fn):
                 f"⏳ 面板兼容 session 失效,正在用账号 "
                 f"{_mask_phone(server.account_phone)} 重新登录..."
             )
-            ok, msg = await _refresh_token_for(server)
+            ok, msg = await _refresh_token_for(server, verification_provider)
             if not ok:
                 return None, f"刷新失败: {msg}", server
             server = servers.get_server(server.name) or server
@@ -2629,7 +2795,9 @@ async def _info(
             return_exceptions=True,
         )
 
-    result, msg, server = await _with_panel_refresh(matcher, server, _fetch)
+    result, msg, server = await _with_panel_refresh(
+        matcher, event, server, _fetch
+    )
     if result is None:
         await matcher.finish(f"❌ 查询失败: {msg}")
 
@@ -2728,7 +2896,9 @@ async def _do_list_jars(
     async def _do(panel: PanelClient):
         return await panel.list_directory(server.instance_uuid, directory)
 
-    result, msg, server = await _with_panel_refresh(matcher, server, _do)
+    result, msg, server = await _with_panel_refresh(
+        matcher, event, server, _do
+    )
     if result is None:
         await matcher.finish(f"❌ {msg}")
 
@@ -3147,7 +3317,9 @@ async def _log(
             server.instance_uuid, "/logs/latest.log",
         )
 
-    result, msg, server = await _with_panel_refresh(matcher, server, _fetch)
+    result, msg, server = await _with_panel_refresh(
+        matcher, event, server, _fetch
+    )
     if result is None:
         await matcher.finish(f"❌ 读日志失败: {msg}")
 
@@ -3204,7 +3376,9 @@ async def _restart(
         await panel.power(server.instance_uuid, "restart")
         return True
 
-    result, msg, server = await _with_panel_refresh(matcher, server, _do)
+    result, msg, server = await _with_panel_refresh(
+        matcher, event, server, _do
+    )
     if result is None:
         await matcher.finish(f"❌ 重启失败: {msg}")
 
@@ -3316,6 +3490,8 @@ async def _help(matcher: Matcher, event: MessageEvent):
         "\n"
         "━━ 📌 其他 ━━\n"
         "取消｜退出当前多步操作\n"
+        "图形验证码 <答案>｜登录风控时提交图片计算结果\n"
+        "短信验证码 <6位> / 验证码 <6位>｜继续风险登录\n"
         "帮助 / help｜再次显示本帮助\n"
         "\n"
         f"指令冷却：{config.command_cooldown} 秒\n"
