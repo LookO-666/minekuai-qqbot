@@ -18,7 +18,7 @@ Send `开服` (start server) in a QQ group to request both the [Minekuai](https:
 - **Real-time event feed:** watches the Pterodactyl console over WebSocket for joins, leaves, deaths, and advancements; falls back to polling `latest.log`
 - **Player linking and statistics:** links QQ users to Minecraft names, uses QQ display names, supports mentions, playtime leaderboards, and death leaderboards
 - **Status and administration:** player count, player list, latency, version, CPU, memory, disk, mods, plugins, logs, console commands, and instance restarts
-- **Administrator-only modpack replacement:** search and select a pack/release in QQ, then use a one-time destructive-action confirmation; persistent maintenance protection remains until an administrator explicitly releases it
+- **Administrator-only modpack replacement:** search and select a pack/release in QQ, then explicitly authorize time-card billing and a clean installation; persistent maintenance protection remains until an administrator releases it
 - **Smart background management:** idle shutdown, a cancellable 60-second countdown, temporary suspension, and automatic keepalive for servers not started for six days
 - **Resource alerts:** notifies administrators only after CPU or memory stays above a threshold, with sustained checks and cooldowns to avoid spam
 - **Multiple servers:** controls multiple instances from one bot; status queries can be aggregated while administrative actions target a specific server
@@ -80,10 +80,10 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 | Command | Description |
 |---|---|
 | 🔒 `更换整合包 [server] [keyword]` / `切换整合包` | Search the catalog, browse pack/release pages, and select a replacement. Follow the numbered prompts; version `0` selects the release shown on the main catalog entry. |
-| 🔒 `确认清空安装 <6-digit code>` | Confirm deletion and installation within five minutes, using the same QQ user, bot, and group or private conversation that issued the code. |
-| 🔒 `取消更换整合包` | Cancel your pending selection/confirmation. Does not abort an installation already submitted or release maintenance protection. |
-| 🔒 `整合包状态 [server]` | Inspect the server's modpack/maintenance status. A submitted request is not proof of completed installation. |
-| 🔒 `结束整合包维护 <server> 我已核对` | Explicitly release protection after checking on the Minekuai website that installation has ended, successfully or unsuccessfully. Does not cancel or complete the remote installation. |
+| 🔒 `确认清空安装 <6-digit code>` | Authorize time-card activation (consuming paid time), deletion, and installation within five minutes, using the same QQ user, bot, and group or private conversation that issued the code. |
+| 🔒 `取消更换整合包` | Cancel your pending selection/confirmation. Does not undo time-card activation, abort a submitted installation, or release maintenance protection. |
+| 🔒 `整合包状态 [server]` | Inspect modpack/maintenance status. Submission is not completion; billing may still be active and must be checked on the website. |
+| 🔒 `结束整合包维护 <server> 我已核对` | Release protection after verifying installation has ended and checking billing on the website. Does not stop billing, cancel installation, or start the game. |
 
 ### Server and account configuration
 
@@ -115,13 +115,15 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 
 ## Replacing a modpack safely
 
-**This operation overwrites all server files, including the world. Back up anything you need yourself before confirming. The bot does not create an automatic backup.**
+**Confirmation authorizes time-card activation, which consumes your available time, and replacement of all server files, including the world. Back up anything you need yourself first. The bot does not create an automatic backup.**
 
-1. Back up the existing files and stop the instance yourself. The bot will not force-kill a running instance or enable time-card billing to perform an installation.
+1. Back up the existing files and stop the Minecraft instance yourself. The bot will not force-kill a running instance or send a game-start power command during replacement.
 2. Send `更换整合包 <server> <keyword>` and follow the search, pagination, pack, and version prompts. Choose `0` only when you want the version displayed on the main catalog entry.
-3. Check the server, pack, release, Minecraft version, and Java version in the final warning. Send `确认清空安装 <code>` within five minutes in the **same conversation**. A group-issued install confirmation cannot be answered in a private chat or another group. Codes are single-use; a changed server identity or catalog selection requires a new confirmation.
-4. Treat **submitted** as “the installation request was submitted,” not “installation completed.” A timeout or unknown outcome is not retried automatically. Persistent protection blocks power/time-card operations, restarts, console commands, QQ → Minecraft chat writes, and related configuration changes for the affected server/time card, including background operations.
-5. Check progress on the [Minekuai website](https://minekuai.com). Once you have verified that installation has ended or failed, send `结束整合包维护 <server> 我已核对`. This only removes the bot's protection; it does not prove the server is healthy, recover a backup, start the instance, or stop a remote installer.
+3. Check the server, pack, release, Minecraft version, Java version, and billing/deletion warning. Send `确认清空安装 <code>` within five minutes in the **same conversation** to authorize both billing activation and installation. A group-issued confirmation cannot be answered in a private chat or another group. Codes are single-use; changed server identity or catalog data requires a new confirmation.
+4. The bot establishes maintenance protection and activates the time card. **The platform may automatically start the instance when billing is activated.** If this activation causes the instance to start, the bot sends at most one graceful stop command and waits for it to go offline; it never force-kills it. Only read-only confirmation that the instance is unsuspended and offline permits the single installation request. If activation, graceful shutdown, or readiness checks fail, no installation is submitted and protection remains. Unknown writes are not retried automatically. Protection blocks other power/time-card operations, restarts, console commands, QQ → Minecraft chat writes, and related configuration changes, including background operations.
+5. Treat **submitted** as “the installation request was submitted,” not “installation completed.” Check progress and billing on the [Minekuai website](https://minekuai.com). Once you verify that installation has ended or failed, manually stop the time card when appropriate and send `结束整合包维护 <server> 我已核对`. Releasing protection does not stop billing, prove the server is healthy, recover a backup, start the game, or stop a remote installer.
+
+**The bot never automatically closes the time card during this workflow:** doing so could interrupt an installation whose outcome is unknown. A graceful game shutdown does not close the time card. The card may remain active and continue consuming time even after a failure or timeout. Check the website before manually closing it or releasing protection.
 
 Protection is stored in SQLite and survives bot restarts and deletion/recreation of a server configuration. It never expires automatically and is not cleared just because an installation request returned success. `取消更换整合包` only cancels an unsubmitted interaction.
 
@@ -580,7 +582,7 @@ Modpack installation tests use mock requests and temporary state databases; runn
 4. **Restrict `bot/.env` permissions:** run `chmod 600 bot/.env`.
 5. **Back up `CREDENTIAL_ENCRYPTION_KEY`.** Never commit it, and do not change it after storing encrypted data. Losing it makes credentials unrecoverable.
 6. **Use a unique, strong Minekuai password.** Database encryption reduces exposure but does not eliminate host or backup compromise risks.
-7. **Treat group-wide administration as full trust.** Keep `ADMIN_ALL_GROUP_MEMBERS=false` unless every member of every allowed group may manage credentials, run console commands, stop or delete servers, and confirm a modpack replacement that clears all files and worlds.
+7. **Treat group-wide administration as full trust.** Keep `ADMIN_ALL_GROUP_MEMBERS=false` unless every member of every allowed group may manage credentials, run console commands, stop or delete servers, and confirm a modpack replacement that activates billing and clears all files and worlds.
 8. **Back up SQLite regularly:**
    ```bash
    cp bot-data/operation_log.db bot-data/operation_log.db.$(date +%F).bak

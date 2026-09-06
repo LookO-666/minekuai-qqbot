@@ -63,8 +63,10 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             logger.error("整合包操作异常: {}", type(exc).__name__)
             message = "操作异常，请查看机器人日志或官网状态"
         if installation:
-            message += ("\n不要直接重复安装。若已有请求发出，维护保护会保留；"
-                        "请先用『整合包状态』并到官网核对结果。")
+            message += ("\n不要直接重复安装。若已开始开卡或安装，维护保护会保留；"
+                        "计时卡可能已开启并继续消耗时长，机器人不会自动关卡。"
+                        "请先用『整合包状态』并到官网核对安装与计费；"
+                        "确认任务结束后再手动关闭计时卡、解除保护。")
         await send_end(matcher, "❌ " + message)
 
     async def session(matcher, bot, event, answer=""):
@@ -123,7 +125,7 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             await failed(matcher, exc)
         matcher.state["mp_identity"] = ServerIdentity.from_server(server)
 
-    @change.got("mp_query", prompt="输入整合包关键词，例如 ATM、机械动力。更换会覆盖全部文件，请先自行备份；取消可退出。")
+    @change.got("mp_query", prompt="输入整合包关键词，例如 ATM、机械动力。确认更换将先开启计时卡并消耗时长，再清空安装；全部文件会被覆盖，请先自行备份；取消可退出。")
     async def search(matcher: Matcher, bot: Bot, event: MessageEvent, query: str = ArgPlainText("mp_query")):
         await session(matcher, bot, event, query)
         query = query.strip()
@@ -196,7 +198,12 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             f"整合包：{choice.name}\n版本：{choice.version or '未标注'}\n"
             f"MC：{choice.game_version or '未标注'} / Java：{choice.java_version or '未标注'}\n"
             "将覆盖全部文件，包括世界存档！机器人不会自动备份。请先自行备份。\n"
-            "确认即授权清空安装；请求提交后会启用维护保护，不会自动开服或开启计费。\n"
+            "确认同时授权：开启计时卡（消耗时长）＋清空安装。\n"
+            "先建立维护保护并开卡；若平台自动启动实例，会尝试一次正常停服。\n"
+            "只读确认实例已解冻且离线后，才提交一次覆盖安装请求。\n"
+            "开卡或就绪检查失败不会提交安装，但维护保护会保留。\n"
+            "不会主动发送游戏启动指令或强杀；也不会自动关卡，计费可能持续。\n"
+            "请在官网确认任务结束后手动关闭计时卡、解除保护。\n"
             "仅原发起人在本会话 5 分钟内发送：\n"
             f"确认清空安装 {pending.code}\n"
             "不更换请发：取消更换整合包")
@@ -206,7 +213,8 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
         await admin(matcher, event)
         try:
             pending = await service.confirm(scope_of(bot, event), args.extract_plain_text().strip(),
-                authorized=lambda: check_admin(event)[0], refresh=refresh_factory(matcher, event))
+                authorized=lambda: check_admin(event)[0], refresh=refresh_factory(matcher, event),
+                progress=lambda text: matcher.send(MessageSegment.text(text)))
         except Exception as exc:
             audit(event.user_id, display_name(event), getattr(event, "group_id", None),
                   "switch_modpack", False, type(exc).__name__)
@@ -215,15 +223,17 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
               f"switch_modpack {pending.server.name}", True, f"submitted item={pending.choice.item_id}")
         await send_end(matcher, f"✅ 『{sanitize_display(pending.server.name)}』安装请求已提交，尚未确认完成。\n"
             "维护保护已开启：机器人暂停该实例的开关服、重启、控制台和聊天桥写入。\n"
+            "本次流程先开启计时卡，平台若自动启动则正常停服后再安装；没有主动发送游戏启动指令或强杀。\n"
+            "计费可能仍在继续，机器人不会自动关卡，请到官网核对。\n"
             f"查看：整合包状态 {pending.server.name}\n"
-            "请在官网确认安装已结束（完成或失败），并检查文件与 Java 版本后，再发送：\n"
+            "请在官网确认安装已结束（完成或失败），检查文件与 Java 版本，按需手动关闭计时卡后，再发送：\n"
             f"结束整合包维护 {pending.server.name} 我已核对")
 
     @cancel.handle()
     async def cancel_install(matcher: Matcher, bot: Bot, event: MessageEvent):
         await admin(matcher, event)
         removed = service.confirms.cancel(scope_of(bot, event))
-        await send_end(matcher, "已取消待确认的整合包更换。" if removed else "没有待确认的安装。已提交的安装不能用此指令撤销。")
+        await send_end(matcher, "已取消待确认的整合包更换。" if removed else "没有待确认的安装。已执行的开卡或安装不能用此指令撤销；请到官网核对计费和安装状态。")
 
     @status.handle()
     async def inspect(matcher: Matcher, event: MessageEvent, args: Message = CommandArg()):
@@ -233,7 +243,7 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
         try:
             entry = service.maintenance.get(server.instance_uuid)
             if entry:
-                phase = {"preparing": "提交前/进程曾中断", "submitted": "请求已提交", "unknown": "请求结果不确定"}.get(entry["phase"], "未知")
+                phase = {"preparing": "开卡或提交前/流程可能中断", "submitted": "请求已提交", "unknown": "请求结果不确定"}.get(entry["phase"], "未知")
                 lines.extend([f"维护保护：开启（{phase}，不代表安装成功）",
                               f"本次选择：{entry['pack_name']} · {entry['pack_version']}"])
             else:
@@ -246,6 +256,7 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
         except Exception as exc:
             lines.append("官网查询未完成：" + (str(exc) if isinstance(exc, EXPECTED_ERRORS) else type(exc).__name__))
         lines.append("这不是已安装整合包的识别结果；请在官网核对安装结果与文件。")
+        lines.append("计时卡可能已开启并继续计费；机器人不会自动关卡。请在官网核对，确认任务结束后手动关卡、解除维护保护。")
         await send_end(matcher, "\n".join(lines))
 
     @finish.handle()
@@ -253,7 +264,7 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
         await admin(matcher, event)
         parts = args.extract_plain_text().strip().rsplit(maxsplit=1)
         if len(parts) != 2 or parts[1] != "我已核对":
-            await send_end(matcher, "请先在官网确认安装已完成、失败或未发生，且已结束。核对文件和 Java 配置后发送：\n结束整合包维护 <服务器> 我已核对")
+            await send_end(matcher, "请先在官网确认安装已完成、失败或未发生，且已结束。核对文件、Java 配置与计费状态，按需手动关闭计时卡后发送：\n结束整合包维护 <服务器> 我已核对")
         server = await resolve(matcher, parts[0])
         try:
             await service.finish_maintenance(server, authorized=lambda: check_admin(event)[0],
@@ -262,6 +273,6 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             await failed(matcher, exc)
         audit(event.user_id, display_name(event), getattr(event, "group_id", None),
               f"finish_modpack_maintenance {server.name}", True, "user acknowledged website check")
-        await send_end(matcher, "维护保护已解除；机器人没有自动开服，也未据此判定安装成功。")
+        await send_end(matcher, "维护保护已解除；机器人没有自动开服，也未据此判定安装成功。计时卡没有被自动关闭，计费可能继续，请到官网核对并按需手动关卡。")
 
     return {"change": change, "confirm": confirm, "cancel": cancel, "status": status, "finish": finish}
