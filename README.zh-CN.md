@@ -159,6 +159,10 @@ nonebot2 + minekuai 插件（业务逻辑）
            └── operation_log 表 — 谁在何时操作了什么
 ```
 
+新版实例电源操作使用面板获取的凭据完成 WebSocket 认证，再发送 `set state`；Minecraft 是否就绪另行检测。
+
+已配置实例 ID 时，计费开关使用 `/system/timeBalance/user/instance/{serverId}/start` 与 `/stop`；未配置实例 ID 才保留旧版整卡接口。控制台 `userPackages` 响应中的计时卡编号字段为 `balanceId`。
+
 两个进程跑在一台机器上，都是 Docker 容器，由 [docker-compose.yml](docker-compose.yml) 编排：
 
 | 容器 | 镜像 | 作用 |

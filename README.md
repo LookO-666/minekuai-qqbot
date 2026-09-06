@@ -161,6 +161,10 @@ nonebot2 + Minekuai plugin (application logic)
            └── operation_log — who performed each operation and when
 ```
 
+Current instance power control authenticates a WebSocket using credentials obtained from the panel, then sends `set state`; Minecraft readiness is checked separately.
+
+Configured instances start/pause billing through `/system/timeBalance/user/instance/{serverId}/start` and `/stop`. The old whole-card routes are retained only for configurations without an instance ID. The dashboard's `userPackages` response names the card ID `balanceId`.
+
 Both processes run on the same machine as Docker containers orchestrated by [docker-compose.yml](docker-compose.yml):
 
 | Container | Image | Purpose |

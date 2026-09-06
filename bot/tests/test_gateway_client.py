@@ -86,6 +86,38 @@ async def test_file_business_auth_error_is_not_file_text(code):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code", [500, "500", 403, "403", 503])
+@pytest.mark.parametrize("message_field", ["msg", "message"])
+async def test_file_business_error_is_not_forwarded_as_log_text(code, message_field):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvdGhlciJ9.signature"
+    secrets = ["new-token", "old-key", "old-cookie", "old-xsrf", jwt]
+    body = {"code": code, message_field: "upstream unavailable " + " ".join(secrets)}
+    client = make_client(lambda _: httpx.Response(200, json=body))
+    try:
+        with pytest.raises(client_mod.APIError) as error:
+            await client.read_file_text("abc", "/logs/latest.log")
+        assert "upstream unavailable" in str(error.value)
+        assert "[REDACTED]" in str(error.value)
+        for secret in secrets:
+            assert secret not in str(error.value)
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [
+    '{"setting":true}', '{"code":500,"setting":true}',
+    '{"code":200,"msg":"file value"}', '"hello"', '[]', 'null',
+])
+async def test_json_file_without_error_envelope_remains_raw_text(content):
+    client = make_client(lambda _: httpx.Response(200, text=content))
+    try:
+        assert await client.read_file_text("abc", "/config.json") == content
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_file_contents_are_raw_text():
     def handler(request):
         assert request.url.path == "/panel/servers/abc/files/contents"

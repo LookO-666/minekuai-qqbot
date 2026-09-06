@@ -190,7 +190,9 @@ async def _auto_close_callback(server: servers.Server) -> tuple[bool, str]:
 async def _auto_close_locked(server: servers.Server) -> tuple[bool, str]:
     try:
         async with _build_client(server) as client:
-            await client.close_server(card_id=server.card_id)
+            await client.close_server(
+                card_id=server.card_id, instance_id=server.instance_uuid,
+            )
         log_operation(
             0, "idle_watcher", None,
             f"auto_close {server.name}", True, "idle timeout",
@@ -205,7 +207,9 @@ async def _auto_close_locked(server: servers.Server) -> tuple[bool, str]:
                 if fresh:
                     try:
                         async with _build_client(fresh) as client:
-                            await client.close_server(card_id=fresh.card_id)
+                            await client.close_server(
+                                card_id=fresh.card_id, instance_id=fresh.instance_uuid,
+                            )
                         log_operation(
                             0, "idle_watcher", None,
                             f"auto_close {server.name}", True,
@@ -249,7 +253,9 @@ async def _auto_start_locked(server: servers.Server) -> tuple[bool, str]:
         while True:
             try:
                 async with _build_client(server) as client:
-                    await client.open_timing_only(card_id=server.card_id)
+                    await client.open_timing_only(
+                        card_id=server.card_id, instance_id=server.instance_uuid,
+                    )
                 break
             except AuthError as e:
                 if refresh_attempted or not server.account_phone:
@@ -274,7 +280,9 @@ async def _auto_start_locked(server: servers.Server) -> tuple[bool, str]:
             if err != "ok":
                 try:
                     async with _build_client(server) as client:
-                        await client.close_server(card_id=server.card_id)
+                        await client.close_server(
+                            card_id=server.card_id, instance_id=server.instance_uuid,
+                        )
                 except Exception:
                     logger.exception(f"保活启动『{server.name}』实例失败后关闭计时卡也失败")
                 log_operation(
@@ -773,7 +781,9 @@ async def _start_server_locked(
         try:
             # 第 1 步：开计时卡（Bearer JWT）
             async with _build_client(server) as client:
-                await client.open_timing_only(card_id=server.card_id)
+                await client.open_timing_only(
+                    card_id=server.card_id, instance_id=server.instance_uuid,
+                )
 
             # 第 2 步：实例启动（复用 JWT，账号只用于自动续期）
             instance_msg = ""
@@ -991,7 +1001,9 @@ async def _stop_server_locked(
     while True:
         try:
             async with _build_client(server) as client:
-                await client.close_server(card_id=server.card_id)
+                await client.close_server(
+                    card_id=server.card_id, instance_id=server.instance_uuid,
+                )
             update_cooldown(user_id, "stop")
             log_operation(
                 user_id, user_name, group_id, f"stop {server.name}", True

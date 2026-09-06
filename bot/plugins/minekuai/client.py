@@ -192,27 +192,31 @@ class MinekuaiClient:
         """只读查询当前账号的计时卡套餐，不改变计时卡状态。"""
         return await self._request("GET", "/system/timeBalance/user/userPackages")
 
-    async def start_timing(self, card_id: str) -> dict:
-        """打开计时卡（开始计时扣费）"""
+    async def start_timing(self, card_id: str, *, instance_id: str = "") -> dict:
+        """新版按实例开启计费；无实例 ID 时保留旧计时卡操作。"""
+        path = (f"/system/timeBalance/user/instance/{instance_id}/start" if instance_id
+                else f"/system/timeBalance/user/startTiming/{card_id}")
         return await self._request(
-            "POST", f"/system/timeBalance/user/startTiming/{card_id}"
+            "POST", path
         )
 
-    async def stop_timing(self, card_id: str) -> dict:
-        """关闭计时卡（停止计时）"""
+    async def stop_timing(self, card_id: str, *, instance_id: str = "") -> dict:
+        """新版暂停指定实例计费；无实例 ID 时保留旧计时卡操作。"""
+        path = (f"/system/timeBalance/user/instance/{instance_id}/stop" if instance_id
+                else f"/system/timeBalance/user/stopTiming/{card_id}")
         return await self._request(
-            "POST", f"/system/timeBalance/user/stopTiming/{card_id}"
+            "POST", path
         )
 
     # ============================================================
     # 组合接口（业务流程）
     # ============================================================
 
-    async def open_timing_only(self, card_id: str) -> None:
-        """只开计时卡。实例启动由 PanelClient.start_instance 负责。"""
+    async def open_timing_only(self, card_id: str, *, instance_id: str = "") -> None:
+        """开启计费。实例电源状态由 PanelClient.start_instance 另行确认。"""
         logger.info(f"[开服] 打开计时卡 {card_id}")
         try:
-            await self.start_timing(card_id)
+            await self.start_timing(card_id, instance_id=instance_id)
         except APIError as e:
             raise APIError(f"打开计时卡失败: {e}") from e
         logger.info("[开服] 计时卡已开启")
@@ -220,10 +224,10 @@ class MinekuaiClient:
     # 向后兼容别名
     open_server = open_timing_only
 
-    async def close_server(self, card_id: str) -> None:
+    async def close_server(self, card_id: str, *, instance_id: str = "") -> None:
         """关服流程：关闭计时卡（关闭计时卡后实例自动停止）"""
         logger.info(f"[关服] 关闭计时卡 {card_id}")
-        await self.stop_timing(card_id)
+        await self.stop_timing(card_id, instance_id=instance_id)
         logger.info("[关服] 流程完成")
 
 
@@ -495,7 +499,7 @@ class PanelClient:
         if r.status_code >= 400:
             raise APIError(f"面板 HTTP {r.status_code}: {self._error_text(r.text)[:200]}")
         if self._token:
-            # The gateway can report authentication errors with HTTP 200 even
+            # The gateway can report business errors with HTTP 200 even
             # though a successful file response is raw text, not a JSON envelope.
             try:
                 failure = r.json()
@@ -503,4 +507,14 @@ class PanelClient:
                 failure = None
             if isinstance(failure, dict) and failure.get("code") in (401, "401", 419, "419"):
                 raise AuthError("面板 JWT 认证失败，请更新认证信息")
+            if (
+                isinstance(failure, dict) and "code" in failure
+                and failure["code"] not in (200, "200", 0, "0", None)
+                and ("msg" in failure or "message" in failure)
+            ):
+                code = self._error_text(failure["code"])
+                detail = self._error_text(
+                    failure.get("msg") or failure.get("message") or "未知错误"
+                )[:200]
+                raise APIError(f"面板文件读取失败 [{code}]: {detail}")
         return r.text

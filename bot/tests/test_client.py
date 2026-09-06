@@ -94,6 +94,27 @@ async def test_timing_endpoints_use_migrated_api_host(operation, args, method, p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method,action", [
+    ("start_timing", "start"), ("stop_timing", "stop"),
+    ("open_timing_only", "start"), ("open_server", "start"), ("close_server", "stop"),
+])
+async def test_current_billing_targets_instance_not_whole_card(method, action):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        assert str(request.url) == f"https://api.minekuai.cn/system/timeBalance/user/instance/instance-id/{action}"
+        assert request.method == "POST" and request.content == b""
+        assert "card-id" not in str(request.url)
+        return httpx.Response(200, json={"code": 200})
+    client = make_client_with_mock(handler)
+    try:
+        await getattr(client, method)("card-id", instance_id="instance-id")
+        assert len(calls) == 1
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_token_expired_http_401_raises_auth_error():
     """HTTP 401 - 应该抛 AuthError 而不是 APIError"""
     def handler(request: httpx.Request) -> httpx.Response:
