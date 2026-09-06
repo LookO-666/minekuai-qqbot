@@ -1418,8 +1418,8 @@ async def _add_finish(
         )
         await matcher.finish(
             f"❌ 自动登录失败：{e}\n"
-            f"可能账号密码错了，或 minekuai 改了登录页。\n"
-            f"先排查（删账号重加 / 检查密码），然后重新发『添加服务器』"
+            "请根据上面的具体原因处理，再重新发『添加服务器』。\n"
+            "非常用地点需完成图片和短信验证，不必因此删除账号。"
         )
     except Exception as e:
         logger.exception("自动登录时未预期的异常")

@@ -33,6 +33,17 @@ async def test_wrong_user_cannot_submit_code():
 
 
 @pytest.mark.asyncio
+async def test_other_group_cannot_answer_or_cancel_unique_request():
+    broker = verification.VerificationBroker()
+    request = broker.open(100, 200, "sms")
+
+    assert broker.submit(100, 201, "sms", "123456") is False
+    assert broker.cancel(100, 201, "sms") is False
+    assert request.future.done() is False
+    broker.close(request)
+
+
+@pytest.mark.asyncio
 async def test_private_message_can_answer_unique_group_request():
     broker = verification.VerificationBroker()
     request = broker.open(100, 200, "image")

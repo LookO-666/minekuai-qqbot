@@ -162,6 +162,7 @@ async def _do_login(
 
     # 给前端一点时间渲染（vue/react 异步挂载）
     await asyncio.sleep(1.0)
+    await _check_site_verification(page)
 
     # 切到密码登录（如果当前是验证码登录 tab）
     await _switch_to_password_tab(page)
@@ -247,6 +248,24 @@ async def _do_login(
     return token, client_id, session_cookie, xsrf_token
 
 
+async def _check_site_verification(page) -> None:
+    """区分网站安全验证与账号短信验证，避免误报密码或表单错误。"""
+    if await page.locator("#mkl-phone, input[name='phone']").count():
+        return
+    has_captcha_script = await page.locator(
+        'script[src*="captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"]'
+    ).count()
+    has_captcha_elements = (
+        await page.locator("#captcha-element").count()
+        and await page.locator("#h5_captcha-element").count()
+    )
+    if has_captcha_script or has_captcha_elements:
+        raise LoginError(
+            "Minekuai 返回了网站安全验证页，尚未进入账号登录。"
+            "这不是账号密码错误；请联系站点确认机器人服务器的访问限制后重试。"
+        )
+
+
 async def _wait_api_response(
     queue: asyncio.Queue[dict[str, Any]],
     timeout_ms: int,
@@ -297,11 +316,16 @@ async def _complete_sms_login(
     logger.info(f"[auth] 账号 {_mask_phone(phone)} 需要交互式短信验证")
     await _switch_to_sms_tab(page)
     await _fill_sms_phone(page, phone)
+    captcha_image = page.locator(".mkl-captcha-img img").first
+    old_src = (
+        await captcha_image.get_attribute("src") or ""
+        if await captcha_image.count() else ""
+    )
     await _click_send_sms_button(page)
 
-    captcha_image = page.locator(".mkl-captcha-img img").first
     try:
         await captcha_image.wait_for(state="visible", timeout=timeout_ms)
+        await _wait_for_captcha_image(page, old_src, timeout_ms)
     except Exception as e:
         raise LoginError("短信验证已触发，但没有显示图片计算题") from e
 
@@ -337,14 +361,13 @@ async def _complete_sms_login(
             f"[auth] 账号 {_mask_phone(phone)} 图片验证码错误，等待重新输入"
         )
         try:
-            await page.wait_for_function(
-                "oldSrc => document.querySelector('.mkl-captcha-img img')?.src !== oldSrc",
-                image_src,
-                timeout=timeout_ms,
-            )
+            await _wait_for_captcha_image(page, image_src, timeout_ms)
         except Exception:
-            await captcha_image.click(timeout=3_000)
-            await asyncio.sleep(0.5)
+            try:
+                await captcha_image.click(timeout=3_000)
+                await _wait_for_captcha_image(page, image_src, timeout_ms)
+            except Exception:
+                raise LoginError("图片验证码刷新失败，请重新触发登录") from None
 
     if not sms_sent:
         raise LoginError("发送短信验证码失败")
@@ -368,6 +391,18 @@ async def _complete_sms_login(
         message = _response_message(login_response, "未知错误")
         raise LoginError(f"短信登录业务码失败 [{code}]: {message}")
     return login_response.get("body") or {}
+
+
+async def _wait_for_captcha_image(page, old_src: str, timeout_ms: int) -> None:
+    await page.wait_for_function(
+        """oldSrc => {
+            const image = document.querySelector('.mkl-captcha-img img');
+            const src = image?.getAttribute('src');
+            return Boolean(src && src !== oldSrc);
+        }""",
+        arg=old_src,
+        timeout=timeout_ms,
+    )
 
 
 def _extract_image_base64(src: str) -> str:
@@ -498,8 +533,8 @@ async def _switch_to_sms_tab(page) -> None:
 async def _fill_sms_phone(page, phone: str) -> None:
     try:
         await page.locator("#mkl-sms-phone").fill(phone, timeout=3_000)
-    except Exception as e:
-        raise LoginError(f"找不到短信登录手机号输入框: {e}") from e
+    except Exception:
+        raise LoginError("无法填写短信登录手机号，请检查登录页或重试") from None
 
 
 async def _click_send_sms_button(page) -> None:
@@ -529,7 +564,7 @@ async def _fill_image_code(page, answer: str) -> None:
             return
         except Exception as e:
             last_error = e
-    raise LoginError(f"找不到图片验证码输入框: {last_error}")
+    raise LoginError("无法填写图片验证码，请检查登录页或重试") from None
 
 
 async def _click_confirm_send_sms(page) -> None:
@@ -550,8 +585,8 @@ async def _click_confirm_send_sms(page) -> None:
 async def _fill_sms_code(page, code: str) -> None:
     try:
         await page.locator("#mkl-sms-code").fill(code, timeout=3_000)
-    except Exception as e:
-        raise LoginError(f"找不到短信验证码输入框: {e}") from e
+    except Exception:
+        raise LoginError("无法填写短信验证码，请检查登录页或重试") from None
 
 
 async def _fill_phone(page, phone: str) -> None:
@@ -585,7 +620,7 @@ async def _fill_phone(page, phone: str) -> None:
         except Exception as e:
             last_error = e
             continue
-    raise LoginError(f"找不到手机号输入框: {last_error}")
+    raise LoginError("无法填写手机号，请检查登录页或重试") from None
 
 
 async def _fill_password(page, password: str) -> None:
@@ -606,7 +641,7 @@ async def _fill_password(page, password: str) -> None:
         except Exception as e:
             last_error = e
             continue
-    raise LoginError(f"找不到密码输入框: {last_error}")
+    raise LoginError("无法填写密码，请检查登录页或重试") from None
 
 
 async def _click_login_button(page) -> None:

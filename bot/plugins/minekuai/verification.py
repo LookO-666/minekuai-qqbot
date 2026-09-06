@@ -114,6 +114,8 @@ class VerificationBroker:
         )
         if exact and not exact.future.done():
             return exact
+        if group_id is not None:
+            return None
 
         matches = [
             request
@@ -128,4 +130,3 @@ class VerificationBroker:
         """测试和关闭流程使用；取消全部尚未完成的等待项。"""
         for request in list(self._pending.values()):
             self.close(request)
-

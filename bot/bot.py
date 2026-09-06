@@ -10,7 +10,7 @@ nonebot.init()
 
 
 _VERIFICATION_CODE_RE = re.compile(
-    r"((?:图形|图片|短信)?验证码\s+)-?\d{1,8}"
+    r"((?:图形|图片|短信)?验证码\s*)-?\d+"
 )
 
 
