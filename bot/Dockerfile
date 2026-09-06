@@ -29,6 +29,9 @@ RUN playwright install --with-deps chromium && \
 COPY requirements-security.txt ./
 RUN pip install --no-cache-dir -r requirements-security.txt
 
+# Pin the modern single-target WebSocket transport used by gateway power control.
+RUN pip install --no-cache-dir "websockets>=16.0,<17"
+
 # 再拷代码（代码改动不会让依赖层缓存失效）
 COPY bot.py ./
 COPY plugins/ ./plugins/
