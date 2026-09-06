@@ -188,6 +188,10 @@ class MaintenanceStore:
                     ("baseline_log_stamp", "TEXT"),
                     ("install_outcome", "TEXT NOT NULL DEFAULT 'unknown'"),
                     ("attempt_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("pack_project_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("pack_item_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("pack_game_version", "TEXT NOT NULL DEFAULT ''"),
+                    ("pack_java_version", "TEXT NOT NULL DEFAULT ''"),
                 ):
                     if name not in columns:
                         connection.execute(f"ALTER TABLE modpack_maintenance ADD COLUMN {name} {definition}")
@@ -216,11 +220,13 @@ class MaintenanceStore:
                     """INSERT INTO modpack_maintenance
                     (instance_uuid, card_id, server_name, server_created_at, phase,
                      pack_name, pack_version, created_at, updated_at, write_started_at,
-                     baseline_log_stamp, install_outcome, attempt_id)
-                    VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, 0, '', 'unknown', ?)""",
+                     baseline_log_stamp, install_outcome, attempt_id,
+                     pack_project_id, pack_item_id, pack_game_version, pack_java_version)
+                    VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, 0, '', 'unknown', ?, ?, ?, ?, ?)""",
                     (
                         server.instance_uuid, server.card_id, server.name, server.created_at,
                         choice.name, choice.version, now, now, secrets.token_hex(16),
+                        choice.project_id, choice.item_id, choice.game_version, choice.java_version,
                     ),
                 )
         except sqlite3.IntegrityError:

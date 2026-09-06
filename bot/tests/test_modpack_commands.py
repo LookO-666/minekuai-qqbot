@@ -1,6 +1,7 @@
 """Offline QQ command tests; real confirmation state, fake UI and service I/O."""
 from dataclasses import replace
 import ast
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -136,13 +137,18 @@ def ui(monkeypatch):
         }),
         reconcile_for_operation=AsyncMock(return_value={"maintenance": False, "released": False}),
         install_log=AsyncMock(return_value="[时间] 正在安装..."),
+        client_download=AsyncMock(return_value={
+            "name": "Test Pack", "version": "v2", "game_version": "1.21.1", "java_version": "21",
+            "url": "https://www.123865.com/s/CiAtjv-xGYr", "code": "", "exact": False,
+            "detail": "免费目录，不调用扣积分直链接口。",
+        }),
         finish_maintenance=AsyncMock(),
     )
 
     async def prepare(scope, selected_server, choice, refresh=None):
         return confirms.issue(scope, state.ServerIdentity.from_server(selected_server), choice)
 
-    async def confirm(scope, code, *, authorized, refresh=None, progress=None):
+    async def confirm(scope, code, *, authorized, refresh=None, progress=None, on_submitted=None):
         pending = confirms.consume(scope, code)
         if not authorized():
             raise state.ConfirmError("管理员权限已变化，本次确认已取消")
@@ -150,24 +156,30 @@ def ui(monkeypatch):
         if progress is not None:
             for text in PROGRESS_MESSAGES:
                 await progress(text)
+        if on_submitted is not None:
+            await on_submitted(pending)
         return pending
 
     service.prepare = AsyncMock(side_effect=prepare)
     service.confirm = AsyncMock(side_effect=confirm)
     allowed = [True]
+    read_allowed = [True]
     check_admin = Mock(side_effect=lambda event: (allowed[0], "没有管理员权限"))
+    check_permission = Mock(side_effect=lambda event: (read_allowed[0], "没有机器人访问权限"))
     audit = Mock()
     registry = commands.register_modpack_commands(
         servers=SimpleNamespace(
             list_servers=lambda: [server], get_server=lambda name: server if name == server.name else None,
         ),
         service=service, check_admin=check_admin, refresh_factory=lambda matcher, event: None,
+        check_permission=check_permission,
         audit=audit, display_name=lambda event: "tester",
     )
     return SimpleNamespace(
         commands=commands, registry=registry, registered=registered, service=service,
         state_module=state, server=server, project=project, version=version,
         now=now, allowed=allowed, check_admin=check_admin, audit=audit,
+        read_allowed=read_allowed, check_permission=check_permission,
         matcher=Matcher(), bot=SimpleNamespace(self_id="100"),
         event=SimpleNamespace(user_id=200, group_id=300),
     )
@@ -196,13 +208,14 @@ def current_code(ui):
     return ui.service.confirms._pending[ui.commands.scope_of(ui.bot, ui.event)].code
 
 
-async def invoke(ui, command, text="", *, event=None, bot=None):
-    matcher = Matcher()
+async def invoke(ui, command, text="", *, event=None, bot=None, matcher=None):
+    matcher = matcher or Matcher()
+    ui.last_matcher = matcher
     event, bot = event or ui.event, bot or ui.bot
     handlers = ui.registry[command].handlers
     fn = next(iter(handlers.values()))
     with pytest.raises(Finished):
-        if command in {"status", "finish", "logs"}:
+        if command in {"status", "finish", "logs", "client"}:
             await fn(matcher, event, Message(text))
         elif command == "cancel":
             await fn(matcher, bot, event)
@@ -436,9 +449,10 @@ async def test_status_reconciles_without_installing_or_identifying_completed_pac
 
 def test_registers_expected_commands_and_alias(ui):
     assert set(ui.registered) == {
-        "更换整合包", "确认清空安装", "取消更换整合包", "整合包状态", "结束整合包维护", "整合包日志",
+        "更换整合包", "确认清空安装", "取消更换整合包", "整合包状态", "结束整合包维护", "整合包日志", "整合包客户端",
     }
     assert ui.registered["更换整合包"].options["aliases"] == {"切换整合包"}
+    assert ui.registered["整合包客户端"].options["aliases"] == {"客户端", "下载客户端"}
 
 
 @pytest.mark.asyncio
@@ -497,7 +511,9 @@ async def test_confirm_progress_is_sent_after_consumption_and_guard(ui):
         await ui.registry["confirm"].handlers["install"](
             matcher, ui.bot, ui.event, Message(code),
         )
-    assert matcher.sent == list(PROGRESS_MESSAGES)
+    assert matcher.sent[:len(PROGRESS_MESSAGES)] == list(PROGRESS_MESSAGES)
+    assert len(matcher.sent) == len(PROGRESS_MESSAGES) + 1
+    assert "下载入口" in matcher.sent[-1]
     assert callable(ui.service.confirm.await_args.kwargs["progress"])
     assert "安装请求已提交，尚未确认完成" in matcher.final
 
@@ -766,3 +782,255 @@ async def test_guard_appearing_during_selection_blocks_before_new_confirmation(u
         await ui.registry["change"].handlers["choose_version"](ui.matcher, ui.bot, ui.event, "0")
     ui.service.prepare.assert_not_awaited()
     ui.service.confirm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_client_download_command_is_readonly_and_allowed_for_regular_member(ui):
+    ui.allowed[0] = False  # No administrator privileges.
+    message = await invoke(ui, "client", "test")
+    ui.service.client_download.assert_awaited_once_with(ui.server, refresh=None)
+    assert "下载入口" in message and "未上传群文件" in message
+    assert "根据最近一次整合包选择记录提供，不代表已识别当前文件或安装成功" in message
+    assert "官方免费客户端目录（非该版本直链）" in message
+    assert "目录不保证提供该版本" in message
+    assert "该版本客户端下载链接：" not in message
+    ui.service.prepare.assert_not_awaited()
+    ui.service.confirm.assert_not_awaited()
+    ui.service.reconcile_maintenance.assert_not_awaited()
+    ui.service.reconcile_for_operation.assert_not_awaited()
+    ui.service.maintenance.begin.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_client_download_denied_access_never_queries_metadata(ui):
+    ui.read_allowed[0] = False
+    assert "没有机器人访问权限" in await invoke(ui, "client", "test")
+    ui.service.client_download.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_client_download_optional_permission_defaults_to_admin(ui):
+    ui.allowed[0] = False
+    registry = ui.commands.register_modpack_commands(
+        servers=SimpleNamespace(list_servers=lambda: [ui.server], get_server=lambda name: ui.server),
+        service=ui.service, check_admin=ui.check_admin,
+        refresh_factory=lambda *args: None, audit=ui.audit, display_name=lambda event: "tester",
+    )
+    matcher = Matcher()
+    with pytest.raises(Finished, match="没有管理员权限"):
+        await registry["client"].handlers["read_client_download"](matcher, ui.event, Message("test"))
+    ui.service.client_download.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_client_link_includes_version_runtime_and_extraction_code(ui):
+    ui.service.client_download.return_value.update(
+        url="https://downloads.example.test/client-v2.zip", exact=True, code="abcd",
+        detail="官方目录提供的该版本客户端地址。",
+    )
+    message = await invoke(ui, "client")
+    assert "该版本客户端下载链接：" in message
+    assert "官方免费客户端目录" not in message
+    for expected in ("Test Pack", "v2", "1.21.1", "21", "提取码：abcd", "未上传群文件"):
+        assert expected in message
+    assert "https://downloads.example.test/client-v2.zip" in message.splitlines()
+
+
+@pytest.mark.asyncio
+async def test_missing_client_link_is_explicit_not_claimed_as_upload(ui):
+    ui.service.client_download.return_value.update(url="", exact=False, detail="未找到可用客户端信息。")
+    message = await invoke(ui, "client", "test")
+    assert "暂未提供可用的客户端下载链接" in message
+    assert "未找到可用客户端信息" in message
+    assert "已上传" not in message
+
+
+@pytest.mark.asyncio
+async def test_client_metadata_failure_is_generic_and_never_exposes_exception(ui):
+    ui.service.client_download.side_effect = RuntimeError("private-token private-account response body")
+    message = await invoke(ui, "client", "test")
+    assert "客户端下载信息暂不可用" in message and "整合包客户端 test" in message
+    assert "private-token" not in message and "RuntimeError" not in message
+    ui.service.confirm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_client_read_permission_revoked_during_metadata_lookup_suppresses_url(ui):
+    info = dict(ui.service.client_download.return_value)
+
+    async def download(*args, **kwargs):
+        ui.read_allowed[0] = False
+        return info
+
+    ui.service.client_download.side_effect = download
+    message = await invoke(ui, "client", "test")
+    assert "没有机器人访问权限" in message and info["url"] not in message
+
+
+@pytest.mark.asyncio
+async def test_client_read_changed_server_identity_suppresses_old_url(ui):
+    ui.service.current.side_effect = ui.commands.MinekuaiError("private binding details")
+    message = await invoke(ui, "client", "test")
+    assert "服务器绑定已变化" in message
+    assert "https://" not in message and "private binding details" not in message
+
+
+@pytest.mark.asyncio
+async def test_install_submission_sends_selected_release_to_original_matcher(ui):
+    selected = await choose_release(ui, "1")
+    matcher = Matcher()
+    result = await invoke(ui, "confirm", current_code(ui), matcher=matcher)
+    ui.service.client_download.assert_awaited_once_with(ui.server, choice=selected, refresh=None)
+    assert matcher.sent[:3] == list(PROGRESS_MESSAGES)
+    assert len(matcher.sent) == 4
+    notice = matcher.sent[-1]
+    assert "所选版本，不代表安装已成功" in notice
+    assert "官方免费客户端目录（非该版本直链）" in notice
+    assert "下载入口" in notice and "未上传群文件" in notice
+    assert "尚未确认完成" in result
+    assert callable(ui.service.confirm.await_args.kwargs["on_submitted"])
+    # Fake bot has no arbitrary-group send or upload API; all output is through this matcher.
+    assert vars(ui.bot) == {"self_id": "100"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [{"user_id": 201}, {"group_id": 301}, {"group_id": None}])
+async def test_invalid_confirmation_scope_never_sends_client_information(ui, override):
+    await choose_release(ui)
+    event = SimpleNamespace(**{**vars(ui.event), **override})
+    await invoke(ui, "confirm", current_code(ui), event=event)
+    ui.service.client_download.assert_not_awaited()
+    assert not ui.last_matcher.sent
+
+
+@pytest.mark.asyncio
+async def test_confirmation_failure_before_submission_has_no_client_notice(ui):
+    await choose_release(ui)
+    ui.service.confirm.side_effect = ui.commands.MinekuaiError("实例未就绪，未提交安装")
+    await invoke(ui, "confirm", current_code(ui))
+    ui.service.client_download.assert_not_awaited()
+    assert not ui.last_matcher.sent
+
+
+@pytest.mark.asyncio
+async def test_missing_client_url_does_not_change_install_submission(ui):
+    await choose_release(ui)
+    ui.service.client_download.return_value.update(url="", detail="该目录暂未提供客户端。")
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert "暂未提供可用的客户端下载链接" in ui.last_matcher.sent[-1]
+    assert "尚未确认完成" in message
+    ui.service.confirm.assert_awaited_once()
+    ui.service.maintenance.begin.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_client_metadata_exception_does_not_cancel_or_repeat_install(ui):
+    await choose_release(ui)
+    ui.service.client_download.side_effect = RuntimeError("private JWT response secret")
+    message = await invoke(ui, "confirm", current_code(ui))
+    notice = ui.last_matcher.sent[-1]
+    assert "客户端下载信息暂不可用" in notice
+    assert "不影响安装，请勿重复安装" in notice
+    assert "private JWT" not in notice
+    assert "尚未确认完成" in message
+    ui.service.confirm.assert_awaited_once()
+    ui.service.maintenance.begin.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_client_notice_send_failure_does_not_change_install_result(ui):
+    await choose_release(ui)
+    matcher = Matcher()
+
+    async def send(text):
+        if "下载入口" in str(text):
+            raise RuntimeError("private QQ error")
+        matcher.sent.append(str(text))
+
+    matcher.send = send
+    message = await invoke(ui, "confirm", current_code(ui), matcher=matcher)
+    assert matcher.sent == list(PROGRESS_MESSAGES)
+    assert "尚未确认完成" in message and "private QQ" not in message
+    ui.service.confirm.assert_awaited_once()
+    ui.service.maintenance.begin.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_client_metadata_timeout_gives_bounded_fallback_and_continues(ui, monkeypatch):
+    await choose_release(ui)
+    monkeypatch.setattr(ui.commands, "CLIENT_METADATA_TIMEOUT", .01)
+
+    async def download(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    ui.service.client_download.side_effect = download
+    message = await asyncio.wait_for(invoke(ui, "confirm", current_code(ui)), timeout=1)
+    assert "客户端下载信息暂不可用" in ui.last_matcher.sent[-1]
+    assert "尚未确认完成" in message
+    ui.service.confirm.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_client_notice_timeout_does_not_block_install_observation(ui, monkeypatch):
+    await choose_release(ui)
+    monkeypatch.setattr(ui.commands, "CLIENT_NOTICE_TIMEOUT", .01)
+    matcher = Matcher()
+
+    async def send(text):
+        if "下载入口" in str(text):
+            await asyncio.Event().wait()
+        matcher.sent.append(str(text))
+
+    matcher.send = send
+    message = await asyncio.wait_for(invoke(ui, "confirm", current_code(ui), matcher=matcher), timeout=1)
+    assert "尚未确认完成" in message
+    assert matcher.sent == list(PROGRESS_MESSAGES)
+    ui.service.confirm.assert_awaited_once()
+    ui.service.maintenance.begin.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["permission", "identity", "scope"])
+async def test_auto_client_notice_rechecks_identity_permission_and_original_scope(ui, changed):
+    await choose_release(ui)
+    info = dict(ui.service.client_download.return_value)
+
+    async def download(*args, **kwargs):
+        if changed == "permission":
+            ui.allowed[0] = False
+        elif changed == "identity":
+            ui.service.current.side_effect = ui.commands.MinekuaiError("binding changed")
+        else:
+            ui.event.group_id = 999
+        return info
+
+    ui.service.client_download.side_effect = download
+    await invoke(ui, "confirm", current_code(ui))
+    assert ui.last_matcher.sent == list(PROGRESS_MESSAGES)
+    ui.service.confirm.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_repeated_submission_callback_does_not_duplicate_notice(ui):
+    await choose_release(ui)
+
+    async def confirm(scope, code, *, on_submitted, **kwargs):
+        pending = ui.service.confirms.consume(scope, code)
+        ui.service.maintenance.begin(pending.server, pending.choice)
+        await on_submitted(pending)
+        await on_submitted(pending)
+        return pending
+
+    ui.service.confirm.side_effect = confirm
+    await invoke(ui, "confirm", current_code(ui))
+    ui.service.client_download.assert_awaited_once()
+    assert len(ui.last_matcher.sent) == 1
+    assert "下载入口" in ui.last_matcher.sent[0]
+
+
+def test_production_registration_uses_normal_access_for_client_download():
+    tree = ast.parse((PLUGIN / "__init__.py").read_text(encoding="utf-8"))
+    registration = next(call for call in ast.walk(tree) if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name) and call.func.id == "register_modpack_commands")
+    permission = next(keyword.value for keyword in registration.keywords if keyword.arg == "check_permission")
+    assert isinstance(permission, ast.Name) and permission.id == "_check_perm"

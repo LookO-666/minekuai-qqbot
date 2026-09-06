@@ -171,6 +171,10 @@ def test_begin_stores_only_required_public_metadata(state, store, server, choice
     assert row["phase"] == "preparing"
     assert row["pack_name"] == choice.name
     assert row["pack_version"] == choice.version
+    assert row["pack_project_id"] == choice.project_id
+    assert row["pack_item_id"] == choice.item_id
+    assert row["pack_game_version"] == choice.game_version
+    assert row["pack_java_version"] == choice.java_version
     assert row["server_created_at"] == server.created_at
     assert row["write_started_at"] == 0
     assert row["baseline_log_stamp"] == ""
@@ -180,6 +184,7 @@ def test_begin_stores_only_required_public_metadata(state, store, server, choice
         "instance_uuid", "card_id", "server_name", "server_created_at", "phase",
         "pack_name", "pack_version", "created_at", "updated_at",
         "write_started_at", "baseline_log_stamp", "install_outcome", "attempt_id",
+        "pack_project_id", "pack_item_id", "pack_game_version", "pack_java_version",
     }
     content = store.db_path.read_bytes()
     for secret in (server.token, server.account_phone, choice.file_name, choice.search_query):
@@ -366,6 +371,9 @@ def test_schema_migration_preserves_legacy_unknown_write_boundary(state, tmp_pat
     assert entry["phase"] == "unknown" and entry["install_outcome"] == "unknown"
     assert entry["write_started_at"] is None and entry["baseline_log_stamp"] is None
     assert entry["attempt_id"] == ""
+    assert all(entry[field] == "" for field in (
+        "pack_project_id", "pack_item_id", "pack_game_version", "pack_java_version",
+    ))
     with pytest.raises(state.MaintenanceError):
         migrated.start_write("abcd1234", "")
     migrated.observe(entry, "completed")
@@ -559,6 +567,42 @@ def test_latest_prefers_active_guard_then_most_recent_archive(state, store, serv
     latest = store.latest(server.instance_uuid)
     assert latest["attempt_id"] == second["attempt_id"] != first["attempt_id"]
     assert latest["pack_name"] == "second pack" and latest["release_reason"] == "failed"
+
+
+def test_exact_catalog_identity_survives_archive_and_restart_without_download_secrets(
+    state, store, server, choice,
+):
+    selected = replace(
+        choice, project_id="1970117000000000000", item_id="1970117873469452926",
+        game_version="1.20.1", java_version="17",
+    )
+    expected_metadata = {
+        "pack_project_id": selected.project_id,
+        "pack_item_id": selected.item_id,
+        "pack_game_version": selected.game_version,
+        "pack_java_version": selected.java_version,
+    }
+    store.begin(state.ServerIdentity.from_server(server), selected)
+    entry = store.get(server.instance_uuid)
+    assert {key: entry[key] for key in expected_metadata} == expected_metadata
+    store.observe(entry, "completed")
+    assert store.finish(server.instance_uuid, expected=entry, reason="completed")
+    restarted = state.MaintenanceStore(store.db_path)
+    restarted.init_db()
+    assert restarted.get(server.instance_uuid) is None
+    archived = restarted.latest(server.instance_uuid)
+    assert {key: archived[key] for key in expected_metadata} == expected_metadata
+    assert archived["attempt_id"] == entry["attempt_id"]
+    assert archived["install_outcome"] == archived["release_reason"] == "completed"
+    assert not any(key in archived for key in (
+        "file_name", "fileName", "search_query", "search_page", "version_page",
+        "downloadUrl", "clientUrl", "token", "account_phone",
+    ))
+    content = store.db_path.read_bytes()
+    for secret in (server.token, server.account_phone, selected.file_name, selected.search_query):
+        assert secret.encode() not in content
+    restarted.ensure_card_available(server.card_id)
+    restarted.ensure_instance_available(server.instance_uuid)
 
 
 @pytest.mark.parametrize("field,value", [

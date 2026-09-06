@@ -84,6 +84,7 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 | 🔒 `取消更换整合包` | Cancel your pending selection/confirmation. Does not undo time-card activation, abort a submitted installation, or release maintenance protection. |
 | 🔒 `整合包状态 [server]` | Check installation evidence and billing state. Automatically archive the result and release protection when the task is confirmed safely ended; otherwise keep protection. |
 | 🔒 `整合包日志 [server]` | Read a redacted installation-log excerpt in QQ; never submits an installation request. |
+| `整合包客户端 [server]` / `客户端` / `下载客户端` | Read available client-download information. Uses normal bot access permissions, not administrator-only access. Sends a link, not an uploaded file. |
 | 🔒 `结束整合包维护 [server]` | Request the same safety checks and release protection only when they pass. An unknown or active installation remains protected. The old `我已核对` suffix is accepted but cannot bypass checks. |
 
 ### Server and account configuration
@@ -126,6 +127,10 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 6. Once the current task is confirmed safely ended, the bot archives the result and automatically releases protection. Status checks and `结束整合包维护 <server>` also perform this reconciliation; they keep protection when installation is still active or the outcome is uncertain. Normal completion does not require a website visit or a manual acknowledgment. After a successful installation, send `开服 <server>` to start the game. If you do not need to keep billing active, send `关服 <server>` and, when prompted, `确认关服`. The recorded pack/release is your selection, not an independent identification of the current files; a completed installation does not prove the game is ready to join.
 
 Manual start, stop, restart, and the next modpack selection also check any leftover maintenance guard before proceeding. After installation, `开服 <server>` checks the exact instance's billing state and skips time-card activation when billing is already active.
+
+After an installation request is attempted, the bot also sends client-download information for the **selected** pack/release to the original QQ conversation, before waiting for installation completion. This message is a **download link, not a file upload**, and does not prove installation succeeded. It includes recorded Minecraft/Java versions when available. Only a genuinely supplied release-specific client URL is labeled as an exact link; otherwise the bot clearly labels the official free client directory as **not a version-specific download** and tells you which pack/version to look for. The directory may not contain that release. The bot does not call the download-link resolver that charges account points. Missing links, metadata failures, or a failed QQ notification never retry or cancel installation. Use `整合包客户端 <server>` to query again; availability and exact version matching are not guaranteed.
+
+The manual client query uses the latest saved modpack selection, including an uncertain or failed attempt. It does not identify the current server files or establish that installation succeeded.
 
 **The bot never automatically closes the time card or starts the game during this workflow:** closing billing could interrupt an installation whose outcome is unknown. A graceful game shutdown does not close the time card. Billing may continue even after failure or timeout. Check the reported billing state in QQ and use the normal stop command after protection is safely released.
 

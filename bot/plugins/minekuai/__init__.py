@@ -3667,6 +3667,9 @@ MODPACK_HELP = (
     "取消更换整合包｜撤销未提交的确认\n"
     "整合包状态 [服务器]｜群内自动核对安装结果，已结束时自动解除维护保护\n"
     "整合包日志 [服务器]｜群内查看安装日志，无需离开 QQ\n"
+    "整合包客户端 [服务器] / 客户端 / 下载客户端｜查询客户端链接（普通成员可用）\n"
+    "安装请求发出后会在原会话发送所选版本下载信息；可能仅有免费目录，非版本直链\n"
+    "只发链接，不上传文件、不调用扣积分直链接口；没有链接不影响安装\n"
     "结束整合包维护 <服务器>｜让机器人核对并解除已结束安装的保护\n"
     "开服 / 关服 / 重启会先核对遗留维护；安装中或结果未知仍会阻止操作\n"
 )
@@ -3788,6 +3791,7 @@ modpack_service = ModpackService(
 )
 modpack_commands = register_modpack_commands(
     servers=servers, service=modpack_service, check_admin=_check_admin_perm,
+    check_permission=_check_perm,
     refresh_factory=_modpack_refresh_factory, audit=log_operation,
     display_name=_user_display_name,
 )

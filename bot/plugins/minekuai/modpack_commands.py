@@ -1,4 +1,5 @@
 """QQ modpack selection UI. Installation is a separate, scoped command."""
+import asyncio
 from dataclasses import asdict
 import time
 
@@ -20,6 +21,8 @@ INSTALL_OUTCOME_LABELS = {
     "completed": "已确认完成", "failed": "平台报告失败",
     "installing": "仍在安装中", "unknown": "尚未确认结果", "not_submitted": "未提交安装",
 }
+CLIENT_METADATA_TIMEOUT = 12.0
+CLIENT_NOTICE_TIMEOUT = 5.0
 
 
 def scope_of(bot, event):
@@ -43,8 +46,39 @@ def catalog_prompt(items, total, page, *, project=None):
     return "\n".join(lines)
 
 
+def client_download_text(server, info, *, selected=False):
+    """Render service-validated download metadata as text, never as a file upload."""
+    if not isinstance(info, dict) or not isinstance(info.get("url", ""), str):
+        raise MinekuaiError("客户端下载信息格式异常")
+    name = sanitize_display(info.get("name", ""), 100) or "未标注整合包"
+    version = sanitize_display(info.get("version", ""), 80) or "未标注版本"
+    lines = [f"『{sanitize_display(server.name)}』客户端下载信息（下载入口，未上传群文件）",
+             f"整合包：{name}\n版本：{version}",
+             f"MC：{sanitize_display(info.get('game_version', ''), 40) or '?'} / "
+             f"Java：{sanitize_display(info.get('java_version', ''), 40) or '?'}"]
+    if selected:
+        lines.append("所选版本，不代表安装已成功。")
+    else:
+        lines.append("根据最近一次整合包选择记录提供，不代表已识别当前文件或安装成功。")
+    url = info.get("url", "")
+    if url:
+        if info.get("exact") is True:
+            lines.append("该版本客户端下载链接：")
+        else:
+            lines.extend(["官方免费客户端目录（非该版本直链）：",
+                          "请按上方整合包名称和版本在目录内查找，目录不保证提供该版本。"])
+        lines.append(url)
+        if info.get("code"):
+            lines.append("提取码：" + sanitize_display(info["code"], 80))
+    else:
+        lines.append("暂未提供可用的客户端下载链接。")
+    if info.get("detail"):
+        lines.append(sanitize_display(info["detail"], 320))
+    return "\n".join(lines)
+
+
 def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
-                              audit, display_name):
+                              audit, display_name, check_permission=None):
     """Register once from the plugin after its shared helpers are defined."""
     change = on_command("更换整合包", aliases={"切换整合包"}, priority=5, block=True)
     confirm = on_command("确认清空安装", priority=4, block=True)
@@ -52,6 +86,8 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
     status = on_command("整合包状态", priority=5, block=True)
     finish = on_command("结束整合包维护", priority=5, block=True)
     logs = on_command("整合包日志", priority=5, block=True)
+    client_download = on_command("整合包客户端", aliases={"客户端", "下载客户端"}, priority=5, block=True)
+    check_permission = check_admin if check_permission is None else check_permission
 
     async def send_end(matcher, text):
         await matcher.finish(MessageSegment.text(text))
@@ -60,6 +96,15 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
         ok, reason = check_admin(event)
         if not ok:
             await send_end(matcher, reason)
+
+    async def reader(matcher, event):
+        ok, reason = check_permission(event)
+        if not ok:
+            await send_end(matcher, reason or "没有使用该指令的权限")
+
+    def client_unavailable(server):
+        return (f"客户端下载信息暂不可用，可发『整合包客户端 {sanitize_display(server.name)}』重试；"
+                "不影响安装，请勿重复安装。")
 
     async def failed(matcher, exc, *, installation=False):
         if isinstance(exc, EXPECTED_ERRORS):
@@ -284,10 +329,44 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
     @confirm.handle()
     async def install(matcher: Matcher, bot: Bot, event: MessageEvent, args: Message = CommandArg()):
         await admin(matcher, event)
+        notice_attempted = False
+
+        async def on_submitted(pending):
+            nonlocal notice_attempted
+            if notice_attempted:
+                return
+            notice_attempted = True
+            original_scope = scope_of(bot, event)
+
+            def current_recipient():
+                if pending.scope != original_scope or scope_of(bot, event) != original_scope or not check_admin(event)[0]:
+                    raise ConfirmError("原会话或权限已变化")
+                return service.current(pending.server)
+
+            try:
+                server = current_recipient()
+            except Exception:
+                return
+            try:
+                info = await asyncio.wait_for(service.client_download(
+                    server, choice=pending.choice, refresh=None), timeout=CLIENT_METADATA_TIMEOUT)
+                server = current_recipient()
+                text = client_download_text(server, info, selected=True)
+            except Exception:
+                try:
+                    server = current_recipient()
+                except Exception:
+                    return
+                text = client_unavailable(server)
+            try:
+                await asyncio.wait_for(matcher.send(MessageSegment.text(text)), timeout=CLIENT_NOTICE_TIMEOUT)
+            except Exception:
+                logger.warning("客户端链接通知未发送；不影响安装结果观察")
+
         try:
             pending = await service.confirm(scope_of(bot, event), args.extract_plain_text().strip(),
                 authorized=lambda: check_admin(event)[0], refresh=refresh_factory(matcher, event),
-                progress=lambda text: matcher.send(MessageSegment.text(text)))
+                progress=lambda text: matcher.send(MessageSegment.text(text)), on_submitted=on_submitted)
         except Exception as exc:
             audit(event.user_id, display_name(event), getattr(event, "group_id", None),
                   "switch_modpack", False, type(exc).__name__)
@@ -367,4 +446,24 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
                        f"{text[:3000] or '暂未读取到安装日志。'}\n"
                        f"状态及维护保护请发：整合包状态 {sanitize_display(server.name)}")
 
-    return {"change": change, "confirm": confirm, "cancel": cancel, "status": status, "finish": finish, "logs": logs}
+    @client_download.handle()
+    async def read_client_download(matcher: Matcher, event: MessageEvent, args: Message = CommandArg()):
+        await reader(matcher, event)
+        server = await resolve(matcher, args.extract_plain_text().strip())
+        identity = ServerIdentity.from_server(server)
+        try:
+            info = await asyncio.wait_for(service.client_download(
+                server, refresh=refresh_factory(matcher, event)), timeout=CLIENT_METADATA_TIMEOUT)
+            server = service.current(identity)
+            text = client_download_text(server, info)
+        except Exception:
+            text = client_unavailable(server)
+        await reader(matcher, event)
+        try:
+            service.current(identity)
+        except Exception:
+            await send_end(matcher, "服务器绑定已变化，请重新查询整合包客户端")
+        await send_end(matcher, text)
+
+    return {"change": change, "confirm": confirm, "cancel": cancel, "status": status,
+            "finish": finish, "logs": logs, "client": client_download}

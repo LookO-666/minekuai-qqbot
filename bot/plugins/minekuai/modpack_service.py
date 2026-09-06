@@ -9,11 +9,13 @@ from loguru import logger
 
 try:
     from .client import AuthError, MinekuaiError, _safe_error_text
-    from .modpack_catalog import parse_catalog
+    from .modpack_catalog import CatalogError, normalize_item, parse_catalog, sanitize_display
+    from .modpack_download import build_client_download
     from .modpack_state import ServerIdentity, ConfirmError
 except ImportError:
     from client import AuthError, MinekuaiError, _safe_error_text
-    from modpack_catalog import parse_catalog
+    from modpack_catalog import CatalogError, normalize_item, parse_catalog, sanitize_display
+    from modpack_download import build_client_download
     from modpack_state import ServerIdentity, ConfirmError
 
 
@@ -73,6 +75,84 @@ class ModpackService:
         data, _ = await self.read(server,
             lambda c: c.list_modpack_versions(project_id, page=page, page_size=9), refresh=refresh)
         return parse_catalog(data)
+
+    async def client_download(self, server, choice=None, refresh=None):
+        """Return free client links only; never call a points-charging resolver.
+
+        fileName is the server installer, not a client. A child release must
+        have its own matching catalog row; a parent's latest client is never
+        substituted. Old history can still offer the explicitly labelled free
+        collection without guessing a release ID or rewriting the installation.
+        """
+        identity = ServerIdentity.from_server(server)
+        server = self.current(identity)
+        entry = None
+        if choice is None:
+            entry = self.maintenance.latest(server.instance_uuid)
+            if not entry:
+                raise ModpackError("没有整合包选择记录，暂时无法确定要下载哪个客户端")
+            if any(entry.get(key) != value for key, value in (
+                ("server_name", identity.name), ("card_id", identity.card_id),
+                ("instance_uuid", identity.instance_uuid),
+                ("server_created_at", identity.created_at),
+            )):
+                raise ModpackError("安装记录与当前服务器绑定不一致，未提供其他实例的客户端下载信息")
+            target = {
+                "project_id": entry.get("pack_project_id", ""),
+                "item_id": entry.get("pack_item_id", ""),
+                "name": entry.get("pack_name", ""),
+                "version": entry.get("pack_version", ""),
+                "game_version": entry.get("pack_game_version", ""),
+                "java_version": entry.get("pack_java_version", ""),
+            }
+        else:
+            target = {field: getattr(choice, field) for field in (
+                "project_id", "item_id", "name", "version", "game_version", "java_version",
+            )}
+        info = {key: sanitize_display(target[key], 160 if key == "name" else 80)
+                for key in ("name", "version", "game_version", "java_version")}
+        selected = None
+        ids_valid = all(isinstance(target[key], str) and
+                        re.fullmatch(r"[A-Za-z0-9_-]{1,128}", target[key])
+                        for key in ("project_id", "item_id"))
+        if ids_valid:
+            try:
+                # A pending selection already carries its exact catalog page.
+                # History uses bounded, read-only paging; missing entries fall
+                # back to the free collection, never another release's URL.
+                is_project = target["project_id"] == target["item_id"]
+                pages = (choice.search_page if is_project else choice.version_page,) if choice else range(1, 4)
+                page_size = 9 if choice else 50
+                for page in pages:
+                    if is_project:
+                        query = choice.search_query if choice else target["name"]
+                        payload, _ = await self.read(server, lambda c: c.search_modpacks(
+                            query, page=page, page_size=page_size), refresh=refresh)
+                    else:
+                        payload, _ = await self.read(server, lambda c: c.list_modpack_versions(
+                            target["project_id"], page=page, page_size=page_size), refresh=refresh)
+                    _, total = parse_catalog(payload)
+                    matches = [raw for raw in payload["rows"]
+                               if str(raw.get("id")) == target["item_id"]]
+                    if len(matches) == 1:
+                        item = normalize_item(matches[0])
+                        if all(getattr(item, field) == target[field] for field in target):
+                            selected = matches[0]
+                        break
+                    if matches or page * page_size >= total:
+                        break
+            except (MinekuaiError, CatalogError, ValueError):
+                # This ancillary read cannot change the installation's outcome.
+                # Never expose an API body, auth material or paid download URL.
+                logger.info("[modpack] free client catalog metadata unavailable")
+        server = self.current(identity)
+        if entry is not None:
+            latest = self.maintenance.latest(server.instance_uuid)
+            if not latest or any(latest.get(key) != entry.get(key) for key in (
+                "attempt_id", "created_at", "pack_item_id", "pack_version",
+            )):
+                raise ModpackError("整合包选择记录已变化，请重新查询客户端")
+        return build_client_download(info, selected, secrets=(server.token, server.client_id))
 
     async def instance_details(self, server, refresh=None):
         if not server.instance_uuid:
@@ -467,7 +547,8 @@ class ModpackService:
         await self.validate_choice(server, choice, refresh)
         return self.confirms.issue(scope, ServerIdentity.from_server(server), choice)
 
-    async def confirm(self, scope, code, *, authorized, refresh=None, progress=None):
+    async def confirm(self, scope, code, *, authorized, refresh=None, progress=None,
+                      on_submitted=None):
         # Synchronous consume happens before the first await. Failed attempts
         # never restore confirmation, and submitted POSTs never get replayed.
         pending = self.confirms.consume(scope, code)
@@ -545,6 +626,14 @@ class ModpackService:
                 receipt_error = str(exc) if isinstance(exc, MinekuaiError) else type(exc).__name__
             else:
                 self.maintenance.mark(pending.server.instance_uuid, "submitted")
+            if on_submitted:
+                try:
+                    # Client download metadata is optional and independent of
+                    # the destructive operation. Never replay the installer or
+                    # skip its observation because a QQ notification failed.
+                    await asyncio.wait_for(on_submitted(pending), timeout=20.0)
+                except Exception:
+                    logger.warning("[modpack] optional client download notification unavailable")
             if progress:
                 try:
                     await progress("安装请求已发出，正在核对安装日志，可能需要几分钟。请勿重复安装。"
