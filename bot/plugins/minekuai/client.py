@@ -25,9 +25,9 @@ import httpx
 from loguru import logger
 
 try:
-    from .panel_power import send_power, PreSendAuthError, PowerTransportError
+    from .panel_power import read_state, send_power, PreSendAuthError, PowerTransportError
 except ImportError:
-    from panel_power import send_power, PreSendAuthError, PowerTransportError
+    from panel_power import read_state, send_power, PreSendAuthError, PowerTransportError
 
 
 class MinekuaiError(Exception):
@@ -472,6 +472,25 @@ class PanelClient:
             self._server_path(instance_id, "/power"),
             json={"signal": signal},
         )
+
+    async def get_live_state(self, instance_id: str, *, stable_offline_seconds: float = 3.0) -> dict:
+        """Read authenticated daemon state; never fall back to cached HTTP state."""
+        credentials = await self.get_ws_credentials(instance_id)
+        if (
+            not isinstance(credentials, dict)
+            or not isinstance(credentials.get("socket"), str)
+            or not isinstance(credentials.get("token"), str)
+        ):
+            raise APIError("面板实时状态凭据格式异常")
+        try:
+            return await read_state(
+                credentials["socket"], credentials["token"],
+                stable_offline_seconds=stable_offline_seconds,
+            )
+        except PreSendAuthError as error:
+            raise AuthError(str(error)) from None
+        except PowerTransportError as error:
+            raise APIError(str(error)) from None
 
     async def start_instance(self, instance_id: str) -> None:
         """启动服务器实例。"""

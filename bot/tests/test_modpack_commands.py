@@ -439,7 +439,8 @@ async def test_failed_confirmation_warns_about_billing_and_manual_recovery(ui):
     assert "计时卡可能已开启并继续消耗时长" in message
     assert "不会自动关卡" in message
     assert "到官网核对安装与计费" in message
-    assert "手动关闭计时卡、解除保护" in message
+    assert "任务结束后手动关卡" in message
+    assert "结束整合包维护 <服务器> 我已核对" in message
 
 
 def test_modpack_help_discloses_billing_and_platform_autostart():
@@ -495,3 +496,40 @@ async def test_invalid_confirmation_does_not_emit_billing_progress(ui, invalid):
     assert not matcher.sent
     ui.service.maintenance.begin.assert_not_called()
     assert matcher.final.startswith("❌")
+
+
+@pytest.mark.asyncio
+async def test_service_readiness_error_preserves_reason_without_duplicate_warnings(ui):
+    await choose_release(ui)
+    reason = (
+        "开计时卡或安装前检查未完成：HTTP 实例离线；WS 已认证持续离线；计费状态待确认。"
+        "未提交更换整合包；计费可能已经开启，维护保护保留，"
+        "请先到官网核对计费和实例状态；机器人不会自动关卡"
+    )
+    ui.service.confirm.side_effect = ui.commands.MinekuaiError(reason)
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert reason in message
+    for phrase in ("未提交更换整合包", "维护保护保留", "不会自动关卡", "计费可能已经开启"):
+        assert message.count(phrase) == 1
+    assert "若已开始开卡或安装" not in message
+    assert "计时卡可能已开启并继续消耗时长" not in message
+    assert "整合包状态 <服务器>" in message
+    assert "结束整合包维护 <服务器> 我已核对" in message
+    assert "整合包状态 test" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "安装请求结果未知，维护保护会保留。",
+    "开卡计费结果未知，机器人不会自动关卡。",
+    "未提交更换整合包，维护保护仍然保留；计费可能开启，机器人不自动关卡。",
+])
+async def test_partial_service_warnings_only_add_missing_safety_information(ui, reason):
+    await choose_release(ui)
+    ui.service.confirm.side_effect = ui.commands.MinekuaiError(reason)
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert reason in message
+    assert message.count("维护保护") == 1
+    assert message.count("自动关卡") == 1
+    assert "计费" in message
+    assert "请勿重复安装" in message

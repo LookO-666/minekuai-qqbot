@@ -80,6 +80,7 @@ def harness(monkeypatch, tmp_path):
     h.panel = SimpleNamespace(
         get_server_info=AsyncMock(side_effect=lambda *args: deepcopy(h.info)),
         get_resources=AsyncMock(side_effect=lambda *args: deepcopy(h.resources)),
+        get_live_state=AsyncMock(return_value={"state": "offline", "stable_offline": True}),
         power=AsyncMock(side_effect=power),
     )
     h.confirms = state_mod.InstallConfirmStore(clock=lambda: h.now)
@@ -163,6 +164,7 @@ async def test_preflight_accepts_matching_short_or_full_identity_offline(harness
     server, identifier = await h.service.preflight(h.server)
     assert server is h.server and identifier == IDENTIFIER
     h.panel.get_resources.assert_awaited_once_with(IDENTIFIER)
+    h.panel.get_live_state.assert_not_awaited()  # Initial preflight isn't the install-ready check.
     h.client.switch_modpack.assert_not_awaited()
 
 
@@ -568,6 +570,15 @@ def assert_billing_not_automatically_closed(h):
     h.client.close_timing_only.assert_not_awaited()
 
 
+def mirror_live_resource(h):
+    """Explicit active-state scenarios must update both observation channels."""
+    def live(*args, **kwargs):
+        state = h.resources["attributes"]["current_state"]
+        return {"state": state, "stable_offline": state == "offline"}
+
+    h.panel.get_live_state.side_effect = live
+
+
 @pytest.mark.asyncio
 async def test_active_billing_is_not_started_again(harness):
     h = harness
@@ -588,6 +599,7 @@ async def test_start_billing_precedes_two_offline_rounds_and_final_revalidation(
     pending = issue(h)
     events = []
     original_start = h.client.start_timing.side_effect
+    mirror_live_resource(h)
 
     async def start(card_id, *, instance_id):
         assert h.maintenance.get(IDENTIFIER)["phase"] == "preparing"
@@ -629,6 +641,7 @@ async def test_new_billing_auto_start_is_stopped_once_before_install(harness, st
     h.info["attributes"]["is_suspended"] = True
     pending = issue(h)
     original_start = h.client.start_timing.side_effect
+    mirror_live_resource(h)
 
     async def start(card_id, *, instance_id):
         await original_start(card_id, instance_id=instance_id)
@@ -667,6 +680,7 @@ async def test_normal_stop_errors_never_refresh_or_retry_the_stop(harness, failu
     set_billing(h, 0)
     pending = issue(h)
     original_start = h.client.start_timing.side_effect
+    mirror_live_resource(h)
 
     async def start(card_id, *, instance_id):
         await original_start(card_id, instance_id=instance_id)
@@ -685,12 +699,13 @@ async def test_normal_stop_errors_never_refresh_or_retry_the_stop(harness, failu
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["billing_zero", "suspended", "stopping", "still_running", "unknown_state", "offline_only"])
+@pytest.mark.parametrize("fault", ["billing_zero", "suspended", "stopping", "still_running", "unknown_state"])
 async def test_not_ready_after_billing_start_never_installs(harness, fault):
     h = harness
     set_billing(h, 0)
     pending = issue(h)
     original_start = h.client.start_timing.side_effect
+    mirror_live_resource(h)
 
     async def start(card_id, *, instance_id):
         await original_start(card_id, instance_id=instance_id)
@@ -701,7 +716,6 @@ async def test_not_ready_after_billing_start_never_installs(harness, fault):
         else:
             h.resources["attributes"]["current_state"] = {
                 "stopping": "stopping", "still_running": "running", "unknown_state": "unknown",
-                "offline_only": "offline",
             }[fault]
 
     h.client.start_timing.side_effect = start
@@ -780,6 +794,7 @@ async def test_catalog_change_after_billing_start_keeps_guard_and_prevents_insta
     set_billing(h, 0)
     pending = issue(h)
     original_start = h.client.start_timing.side_effect
+    mirror_live_resource(h)
 
     async def start(card_id, *, instance_id):
         await original_start(card_id, instance_id=instance_id)
@@ -789,6 +804,7 @@ async def test_catalog_change_after_billing_start_keeps_guard_and_prevents_insta
     with pytest.raises(service_mod.ModpackError):
         await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
     h.client.start_timing.assert_awaited_once()
+    assert h.client.search_modpacks.await_count >= 2
     h.client.switch_modpack.assert_not_awaited()
     assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
     assert_billing_not_automatically_closed(h)
@@ -831,10 +847,12 @@ async def test_start_stop_transition_then_two_consecutive_offline_rounds(harness
     pending = issue(h)
     sequence = iter(["starting", "stopping", "offline", "offline", "offline"])
     observed = []
+    mirror_live_resource(h)
 
     async def resources(*args):
         current = next(sequence)
         observed.append(current)
+        h.resources["attributes"]["current_state"] = current
         return {"attributes": {"current_state": current}}
 
     h.panel.get_resources.side_effect = resources
@@ -853,9 +871,12 @@ async def test_nonconsecutive_offline_observations_do_not_authorize_install(harn
     pending = issue(h)
     monkeypatch.setattr(service_mod, "READY_ATTEMPTS", 4)
     sequence = iter(["starting", "offline", "running", "offline"])
+    mirror_live_resource(h)
 
     async def resources(*args):
-        return {"attributes": {"current_state": next(sequence)}}
+        current = next(sequence)
+        h.resources["attributes"]["current_state"] = current
+        return {"attributes": {"current_state": current}}
 
     h.panel.get_resources.side_effect = resources
     with pytest.raises(service_mod.ModpackError, match="未提交更换整合包"):
@@ -879,8 +900,11 @@ async def test_ready_wait_has_total_deadline_and_keeps_unknown_guard(harness, mo
         return deepcopy(h.billing)
 
     h.client.get_user_packages.side_effect = packages
-    with pytest.raises(service_mod.ModpackError, match="未提交更换整合包"):
+    with pytest.raises(service_mod.ModpackError, match="未提交更换整合包") as error:
         await asyncio.wait_for(h.service.confirm(SCOPE, pending.code, authorized=lambda: True), 1)
+    assert "TimeoutError" not in str(error.value)
+    for detail in ("等待", "计费", "HTTP=", "实时="):
+        assert detail in str(error.value)
     h.client.switch_modpack.assert_not_awaited()
     assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
     assert_billing_not_automatically_closed(h)
@@ -925,3 +949,169 @@ async def test_permissions_revoked_during_final_catalog_recheck_block_install(ha
         await h.service.confirm(SCOPE, pending.code, authorized=lambda: authorized[0])
     h.client.switch_modpack.assert_not_awaited()
     assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_new_billing_offline_only_is_allowed_with_stable_live_confirmation(harness):
+    h = harness
+    set_billing(h, 0)
+    pending = issue(h)
+    original_start = h.client.start_timing.side_effect
+
+    async def start(card_id, *, instance_id):
+        await original_start(card_id, instance_id=instance_id)
+        h.resources["attributes"]["current_state"] = "offline"
+
+    h.client.start_timing.side_effect = start
+    await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    h.client.start_timing.assert_awaited_once()
+    h.panel.power.assert_not_awaited()
+    assert h.panel.get_live_state.await_count >= 3  # Two ready rounds plus final preflight.
+    h.client.switch_modpack.assert_awaited_once()
+    assert h.maintenance.get(IDENTIFIER)["phase"] == "submitted"
+    assert_billing_not_automatically_closed(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_state", ["starting", "running"])
+async def test_live_activity_beats_cached_http_offline_for_authorized_billing_stop(harness, active_state):
+    h = harness
+    set_billing(h, 0)
+    pending = issue(h)
+    original_start = h.client.start_timing.side_effect
+
+    async def start(card_id, *, instance_id):
+        await original_start(card_id, instance_id=instance_id)
+        h.resources["attributes"]["current_state"] = "offline"
+
+    h.client.start_timing.side_effect = start
+    h.panel.get_live_state.side_effect = [
+        {"state": active_state, "stable_offline": False},
+        {"state": "offline", "stable_offline": True},
+        {"state": "offline", "stable_offline": True},
+        {"state": "offline", "stable_offline": True},
+    ]
+    await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    h.panel.power.assert_awaited_once_with(IDENTIFIER, "stop")
+    h.client.switch_modpack.assert_awaited_once()
+    assert h.panel.get_live_state.await_count == 4
+    assert_billing_not_automatically_closed(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_state", ["starting", "running", "stopping"])
+async def test_existing_billing_live_activity_refuses_even_when_http_says_offline(harness, active_state):
+    h = harness
+    pending = issue(h)
+    h.panel.get_live_state.return_value = {"state": active_state, "stable_offline": False}
+    with pytest.raises(service_mod.ModpackError, match="未提交更换整合包"):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    h.client.start_timing.assert_not_awaited()
+    h.panel.power.assert_not_awaited()
+    h.client.switch_modpack.assert_not_awaited()
+    assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live", [
+    {"state": "offline", "stable_offline": False},
+    {"state": "unknown", "stable_offline": False},
+    {"state": None, "stable_offline": True}, {}, None,
+])
+async def test_unstable_or_unknown_live_state_does_not_fallback_to_http(harness, live):
+    h = harness
+    pending = issue(h)
+    h.panel.get_live_state.return_value = live
+    with pytest.raises(service_mod.ModpackError, match="未提交更换整合包"):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    h.panel.get_live_state.assert_awaited()
+    h.client.switch_modpack.assert_not_awaited()
+    h.panel.power.assert_not_awaited()
+    assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stable", [None, 1, 0, "true", "false", [], {}])
+async def test_non_boolean_live_stability_never_authorizes_install(harness, stable):
+    h = harness
+    pending = issue(h)
+    h.panel.get_live_state.return_value = {"state": "offline", "stable_offline": stable}
+    with pytest.raises(service_mod.ModpackError, match="未提交更换整合包"):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    h.client.switch_modpack.assert_not_awaited()
+    assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [client_mod.APIError("live disconnected"), client_mod.AuthError("live 401")])
+async def test_live_read_failure_keeps_guard_and_does_not_fallback_to_http(harness, failure):
+    h = harness
+    pending = issue(h)
+    h.panel.get_live_state.side_effect = failure
+    with pytest.raises(service_mod.ModpackError, match="未提交更换整合包"):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    h.panel.get_live_state.assert_awaited_once()
+    h.client.switch_modpack.assert_not_awaited()
+    h.panel.power.assert_not_awaited()
+    assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
+    assert_billing_not_automatically_closed(h)
+
+
+@pytest.mark.asyncio
+async def test_readonly_live_auth_refresh_is_bounded_and_then_requires_stability(harness):
+    h = harness
+    pending = issue(h)
+    h.panel.get_live_state.side_effect = [
+        client_mod.AuthError("expired"),
+        {"state": "offline", "stable_offline": True},
+        {"state": "offline", "stable_offline": True},
+        {"state": "offline", "stable_offline": True},
+    ]
+    refresh = AsyncMock(return_value=(True, "refreshed"))
+    await h.service.confirm(SCOPE, pending.code, authorized=lambda: True, refresh=refresh)
+    refresh.assert_awaited_once()
+    assert h.panel.get_live_state.await_count == 4
+    h.client.switch_modpack.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_live", [
+    {"state": "running", "stable_offline": False},
+    {"state": "offline", "stable_offline": False},
+])
+async def test_final_preflight_rechecks_live_state_after_two_ready_rounds(harness, final_live):
+    h = harness
+    pending = issue(h)
+    h.panel.get_live_state.side_effect = [
+        {"state": "offline", "stable_offline": True},
+        {"state": "offline", "stable_offline": True},
+        final_live,
+    ]
+    with pytest.raises(service_mod.ModpackError, match="未提交更换整合包"):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    assert h.panel.get_live_state.await_count == 3
+    h.client.switch_modpack.assert_not_awaited()
+    assert h.maintenance.get(IDENTIFIER)["phase"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_stale_http_activity_does_not_send_stop_when_live_is_stably_offline(harness):
+    h = harness
+    set_billing(h, 0)
+    h.info["attributes"]["is_suspended"] = True
+    pending = issue(h)
+    readings = iter(["running", "offline", "offline", "offline"])
+    seen = []
+
+    async def resources(*args):
+        current = next(readings)
+        seen.append(current)
+        return {"attributes": {"current_state": current}}
+
+    h.panel.get_resources.side_effect = resources
+    await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    assert seen == ["running", "offline", "offline", "offline"]
+    h.panel.power.assert_not_awaited()
+    h.client.switch_modpack.assert_awaited_once()
+    assert h.panel.get_live_state.await_count == 4
+    assert_billing_not_automatically_closed(h)

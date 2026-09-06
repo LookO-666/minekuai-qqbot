@@ -38,7 +38,7 @@ def power(monkeypatch):
 
 
 def fake_connection(monkeypatch, power, frames, *, fail_enter=False,
-                    fail_power_send=False, fail_exit=False):
+                    fail_power_send=False, fail_exit=False, fail_stats_send=False):
     state = SimpleNamespace(sent=[], connects=[], received=[], frames=list(frames))
 
     class Socket:
@@ -47,11 +47,16 @@ def fake_connection(monkeypatch, power, frames, *, fail_enter=False,
             state.sent.append(packet)
             if packet["event"] == "set state" and fail_power_send:
                 raise RuntimeError(f"send failed {URL} {TOKEN}")
+            if packet["event"] == "send stats" and fail_stats_send:
+                raise RuntimeError(f"send failed {URL} {TOKEN}")
 
         async def recv(self):
             if not state.frames:
                 await asyncio.Future()
             item = state.frames.pop(0)
+            if isinstance(item, tuple):
+                delay, item = item
+                await asyncio.sleep(delay)
             if isinstance(item, BaseException):
                 raise item
             state.received.append(item)
@@ -270,3 +275,203 @@ async def test_cancellation_propagates_without_resending_power(power, monkeypatc
         await power.send_power(URL, TOKEN, "start")
     assert sum(message["event"] == "set state" for message in state.sent) == 1
     assert len(state.connects) == 1
+
+
+@pytest.fixture
+def live(power, monkeypatch):
+    monkeypatch.setattr(power, "LIVE_STATE_EXTRA_SECONDS", 0.25)
+    monkeypatch.setattr(power, "LIVE_STATE_MAX_SECONDS", 0.5)
+    return power
+
+
+def assert_readonly_packets(state):
+    assert all(packet["event"] in {"auth", "send stats"} for packet in state.sent)
+    assert sum(packet["event"] == "auth" for packet in state.sent) <= 1
+    assert sum(packet["event"] == "send stats" for packet in state.sent) <= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_value", ["starting", "running", "stopping"])
+@pytest.mark.parametrize("source", ["status", "stats_string", "stats_object"])
+async def test_live_active_state_returns_without_power(live, monkeypatch, state_value, source):
+    packet = (frame("status", state_value) if source == "status" else
+              frame("stats", json.dumps({"state": state_value}) if source == "stats_string"
+                    else {"state": state_value}))
+    state = fake_connection(monkeypatch, live, [frame("auth success"), packet])
+    assert await live.read_state(URL, TOKEN, stable_offline_seconds=0.02) == {
+        "state": state_value, "stable_offline": False,
+    }
+    assert state.sent == [
+        {"event": "auth", "args": [TOKEN]},
+        {"event": "send stats", "args": [None]},
+    ]
+    assert len(state.connects) == 1
+    assert state.connects[0][1]["proxy"] is None
+    assert state.connects[0][1]["logger"].disabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["status", "stats"])
+async def test_live_offline_requires_quiet_window(live, monkeypatch, source):
+    packet = frame("status", "offline") if source == "status" else frame("stats", '{"state":"offline"}')
+    state = fake_connection(monkeypatch, live, [frame("auth success"), packet])
+    started = asyncio.get_running_loop().time()
+    assert await live.read_state(URL, TOKEN, stable_offline_seconds=0.025) == {
+        "state": "offline", "stable_offline": True,
+    }
+    assert asyncio.get_running_loop().time() - started >= 0.025
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+async def test_repeated_offline_stats_do_not_restart_quiet_window(live, monkeypatch):
+    state = fake_connection(monkeypatch, live, [
+        frame("auth success"), frame("status", "offline"),
+        *[(0.01, frame("stats", '{"state":"offline"}')) for _ in range(20)],
+        frame("status", "running"),
+    ])
+    assert (await live.read_state(URL, TOKEN, stable_offline_seconds=0.08))["stable_offline"]
+    assert frame("status", "running") not in state.received
+    assert state.received.count(frame("stats", '{"state":"offline"}')) < 20
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+async def test_console_and_daemon_activity_reset_live_quiet_window(live, monkeypatch):
+    state = fake_connection(monkeypatch, live, [
+        frame("auth success"), frame("status", "offline"),
+        (0.05, frame("console output", TOKEN)),
+        (0.05, frame("daemon message", URL)),
+    ])
+    result = await live.read_state(URL, TOKEN, stable_offline_seconds=0.08)
+    assert result == {"state": "offline", "stable_offline": True}
+    assert frame("console output", TOKEN) in state.received
+    assert frame("daemon message", URL) in state.received
+    assert TOKEN not in str(result) and URL not in str(result)
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state_value", ["starting", "running", "stopping"])
+async def test_activity_before_quiet_completes_prevents_offline_result(live, monkeypatch, state_value):
+    state = fake_connection(monkeypatch, live, [
+        frame("auth success"), frame("status", "offline"),
+        (0.01, frame("stats", {"state": state_value})),
+    ])
+    assert await live.read_state(URL, TOKEN, stable_offline_seconds=0.1) == {
+        "state": state_value, "stable_offline": False,
+    }
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", [
+    "install started", "install output", "install pull progress", "install completed", "daemon error",
+])
+async def test_live_install_or_daemon_error_fails_closed_and_redacts(live, monkeypatch, event):
+    state = fake_connection(monkeypatch, live, [
+        frame("auth success"), frame("status", "offline"), frame(event, TOKEN, URL),
+    ])
+    with pytest.raises(live.PowerTransportError) as error:
+        await live.read_state(URL, TOKEN, stable_offline_seconds=0.02)
+    assert error.value.command_sent is False
+    assert_redacted(error.value)
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", ["jwt error", "token expired", "token expiring"])
+@pytest.mark.parametrize("authenticated", [False, True])
+async def test_live_auth_errors_are_readonly_retryable(live, monkeypatch, event, authenticated):
+    frames = [frame("auth success"), frame("status", "offline")] if authenticated else []
+    state = fake_connection(monkeypatch, live, frames + [frame(event, TOKEN, URL)])
+    with pytest.raises(live.PreSendAuthError) as error:
+        await live.read_state(URL, TOKEN, stable_offline_seconds=0.02)
+    assert_redacted(error.value)
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frames", [
+    [], [frame("auth success")], [frame("status", "offline"), frame("auth success")],
+    [frame("auth success"), frame("stats", {"memory_bytes": 0})],
+])
+async def test_live_missing_authenticated_state_fails_closed(live, monkeypatch, frames):
+    state = fake_connection(monkeypatch, live, frames)
+    with pytest.raises(live.PowerTransportError) as error:
+        await live.read_state(URL, TOKEN, stable_offline_seconds=0.01)
+    assert_redacted(error.value)
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("packet", [
+    frame("status", "unknown"), frame("status", {}), frame("status"),
+    frame("stats", {"state": "unknown"}), frame("stats", '{"state":null}'),
+])
+async def test_unknown_live_state_cannot_reuse_previous_offline(live, monkeypatch, packet):
+    state = fake_connection(monkeypatch, live, [frame("auth success"), frame("status", "offline"), packet])
+    with pytest.raises(live.PowerTransportError):
+        await live.read_state(URL, TOKEN, stable_offline_seconds=0.01)
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+async def test_repeated_live_activity_has_a_total_deadline(live, monkeypatch):
+    monkeypatch.setattr(live, "LIVE_STATE_MAX_SECONDS", 0.15)
+    state = fake_connection(monkeypatch, live, [
+        frame("auth success"), frame("status", "offline"),
+        *[(0.008, frame("console output", TOKEN)) for _ in range(30)],
+    ])
+    with pytest.raises(live.PowerTransportError) as error:
+        await live.read_state(URL, TOKEN, stable_offline_seconds=0.06)
+    assert error.value.command_sent is False
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["enter", "send", "receive", "exit"])
+async def test_live_transport_failure_redacts_without_retry(live, monkeypatch, failure):
+    frames = [frame("auth success"), frame("status", "offline")]
+    if failure == "receive":
+        frames.append(RuntimeError(f"socket closed {TOKEN} {URL}"))
+    state = fake_connection(
+        monkeypatch, live, frames, fail_enter=failure == "enter", fail_stats_send=failure == "send",
+        fail_exit=failure == "exit",
+    )
+    with pytest.raises(live.PowerTransportError) as error:
+        await live.read_state(URL, TOKEN, stable_offline_seconds=0.01)
+    assert_redacted(error.value)
+    assert error.value.command_sent is False
+    assert len(state.connects) == 1
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds", [0, -1, 10.1, True, None, "3", float("nan"), float("inf")])
+async def test_invalid_live_quiet_time_rejected_before_connect(live, monkeypatch, seconds):
+    state = fake_connection(monkeypatch, live, [])
+    with pytest.raises(live.PowerTransportError):
+        await live.read_state(URL, TOKEN, stable_offline_seconds=seconds)
+    assert not state.connects
+
+
+@pytest.mark.asyncio
+async def test_live_cancellation_propagates_without_any_control(live, monkeypatch):
+    state = fake_connection(monkeypatch, live, [
+        frame("auth success"), frame("status", "offline"), asyncio.CancelledError(),
+    ])
+    with pytest.raises(asyncio.CancelledError):
+        await live.read_state(URL, TOKEN, stable_offline_seconds=0.02)
+    assert_readonly_packets(state)
+
+
+@pytest.mark.asyncio
+async def test_live_unsafe_url_and_missing_dependency_fail_closed(live, monkeypatch):
+    state = fake_connection(monkeypatch, live, [])
+    with pytest.raises(live.PowerTransportError):
+        await live.read_state("ws://unsafe.invalid/socket", TOKEN)
+    assert not state.connects
+    monkeypatch.setattr(live, "_SingleTargetConnect", None)
+    with pytest.raises(live.PowerTransportError):
+        await live.read_state(URL, TOKEN)

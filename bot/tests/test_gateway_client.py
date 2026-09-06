@@ -166,3 +166,78 @@ async def test_only_pre_send_auth_failure_can_trigger_refresh(monkeypatch, after
             await client.power("abc", "start")
     finally:
         await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth", ["gateway", "api_key", "session"])
+async def test_live_state_uses_readonly_ws_for_every_auth_mode(monkeypatch, auth):
+    calls = []
+    payload = {"token": "ws-read-token", "socket": "wss://example.invalid/read"}
+
+    def handler(request):
+        calls.append(request)
+        assert request.method == "GET"
+        assert request.url.path == (
+            "/panel/servers/abc/websocket" if auth == "gateway" else "/api/client/servers/abc/websocket"
+        )
+        return httpx.Response(200, json={"code": 200, "data": payload})
+
+    kwargs = ({"token": "new-token", "client_id": "web-client"} if auth == "gateway" else
+              {"api_key": "old-key"} if auth == "api_key" else
+              {"session_cookie": "session=old-cookie", "xsrf_token": "old-xsrf"})
+    client = PanelClient(**kwargs)
+    client._http = httpx.AsyncClient(base_url=client.BASE_URL, transport=httpx.MockTransport(handler))
+    reader = AsyncMock(return_value={"state": "offline", "stable_offline": True})
+    power_sender = AsyncMock()
+    monkeypatch.setattr(client_mod, "read_state", reader)
+    monkeypatch.setattr(client_mod, "send_power", power_sender)
+    try:
+        assert await client.get_live_state("abc", stable_offline_seconds=4.0) == {
+            "state": "offline", "stable_offline": True,
+        }
+        reader.assert_awaited_once_with(
+            payload["socket"], payload["token"], stable_offline_seconds=4.0,
+        )
+        power_sender.assert_not_awaited()
+        assert len(calls) == 1
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authentication_error", [False, True])
+async def test_live_state_wraps_errors_without_http_fallback_or_retry(monkeypatch, authentication_error):
+    error = client_mod.PreSendAuthError("expired") if authentication_error else client_mod.PowerTransportError("not confirmed")
+    reader = AsyncMock(side_effect=error)
+    monkeypatch.setattr(client_mod, "read_state", reader)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.method == "GET" and request.url.path.endswith("/websocket")
+        return httpx.Response(200, json={"code": 200, "data": {
+            "token": "ws-only", "socket": "wss://example.invalid/ws",
+        }})
+
+    client = make_client(handler)
+    try:
+        with pytest.raises(client_mod.AuthError if authentication_error else client_mod.APIError):
+            await client.get_live_state("abc")
+        assert reader.await_count == 1 and len(calls) == 1
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_live_state_invalid_legacy_credentials_fail_closed(monkeypatch):
+    client = PanelClient(api_key="old-key")
+    client._http = httpx.AsyncClient(base_url=client.BASE_URL,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"data": {}})))
+    reader = AsyncMock()
+    monkeypatch.setattr(client_mod, "read_state", reader)
+    try:
+        with pytest.raises(client_mod.APIError, match="凭据格式异常"):
+            await client.get_live_state("abc")
+        reader.assert_not_awaited()
+    finally:
+        await client._http.aclose()

@@ -63,10 +63,20 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             logger.error("整合包操作异常: {}", type(exc).__name__)
             message = "操作异常，请查看机器人日志或官网状态"
         if installation:
-            message += ("\n不要直接重复安装。若已开始开卡或安装，维护保护会保留；"
-                        "计时卡可能已开启并继续消耗时长，机器人不会自动关卡。"
-                        "请先用『整合包状态』并到官网核对安装与计费；"
-                        "确认任务结束后再手动关闭计时卡、解除保护。")
+            warnings = []
+            if not any(text in message for text in (
+                "维护保护保留", "维护保护会保留", "维护保护仍保留", "维护保护仍然保留",
+            )):
+                warnings.append("若已开始开卡或安装，维护保护会保留。")
+            if "计费" not in message and "消耗时长" not in message:
+                warnings.append("计时卡可能已开启并继续消耗时长。")
+            if "不会自动关卡" not in message and "不自动关卡" not in message:
+                warnings.append("机器人不会自动关卡。")
+            if warnings:
+                message += "\n" + "".join(warnings)
+            message += ("\n先用『整合包状态 <服务器>』并到官网核对安装与计费；"
+                        "任务结束后手动关卡，再发『结束整合包维护 <服务器> 我已核对』。"
+                        "请勿重复安装。")
         await send_end(matcher, "❌ " + message)
 
     async def session(matcher, bot, event, answer=""):

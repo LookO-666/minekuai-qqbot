@@ -7,6 +7,7 @@ that the instance has finished starting or that a restart has completed.
 import asyncio
 import json
 import logging
+import math
 from urllib.parse import urlsplit
 
 try:
@@ -18,6 +19,8 @@ except ImportError:  # Produce a safe operational error if deployment missed it.
 AUTH_TIMEOUT_SECONDS = 10.0
 STATUS_TIMEOUT_SECONDS = 12.0
 SEND_TIMEOUT_SECONDS = 5.0
+LIVE_STATE_EXTRA_SECONDS = 10.0
+LIVE_STATE_MAX_SECONDS = 30.0
 _STATES = {"offline", "starting", "running", "stopping"}
 _EXPECTED_STATES = {
     "start": {"starting", "running"},
@@ -57,7 +60,7 @@ class PowerTransportError(Exception):
         self.command_sent = command_sent
 
 
-def _validate(socket_url: str, ws_token: str, signal: str) -> None:
+def _validate_connection(socket_url: str, ws_token: str) -> None:
     try:
         url = urlsplit(socket_url)
         valid = (
@@ -73,6 +76,10 @@ def _validate(socket_url: str, ws_token: str, signal: str) -> None:
         raise PowerTransportError("面板提供的 WebSocket 地址无效或不安全")
     if not isinstance(ws_token, str) or not ws_token.strip():
         raise PreSendAuthError("缺少面板 WebSocket 登录凭据")
+
+
+def _validate(socket_url: str, ws_token: str, signal: str) -> None:
+    _validate_connection(socket_url, ws_token)
     if not isinstance(signal, str) or signal not in _EXPECTED_STATES:
         raise PowerTransportError("不支持的实例电源操作")
 
@@ -107,6 +114,115 @@ def _check_error(event: str, *, command_sent: bool) -> None:
             else "面板节点报告错误，尚未发送电源指令",
             command_sent=command_sent,
         )
+
+
+def _live_state(event: str, args: list) -> str | None:
+    """Extract only documented live state, never return console/server text."""
+    if event == "status":
+        value = args[0] if args else None
+    elif event == "stats":
+        payload = args[0] if args else None
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(payload, dict) or "state" not in payload:
+            return None
+        value = payload["state"]
+    else:
+        return None
+    if not isinstance(value, str) or value not in _STATES:
+        raise PowerTransportError("节点返回了未知实时状态，无法确认实例离线")
+    return value
+
+
+async def read_state(
+    socket_url: str, ws_token: str, *, stable_offline_seconds: float = 3.0,
+) -> dict:
+    """Observe authenticated daemon state without any game-control command.
+
+    Offline requires a bounded quiet interval. Live console/daemon activity
+    resets it; repeated offline status/stats do not. Installation events,
+    disconnection, missing state, and unknown/error states fail closed.
+    """
+    _validate_connection(socket_url, ws_token)
+    if (
+        type(stable_offline_seconds) not in (int, float)
+        or not 0 < stable_offline_seconds <= 10
+        or not math.isfinite(stable_offline_seconds)
+    ):
+        raise PowerTransportError("离线观察时间必须大于 0 且不超过 10 秒")
+    if _SingleTargetConnect is None:
+        raise PowerTransportError("WebSocket 依赖不可用，无法确认实例实时状态")
+
+    loop = asyncio.get_running_loop()
+    total_timeout = min(
+        LIVE_STATE_MAX_SECONDS,
+        AUTH_TIMEOUT_SECONDS + stable_offline_seconds + LIVE_STATE_EXTRA_SECONDS,
+    )
+    deadline = loop.time() + total_timeout
+
+    async def observe():
+        async with _SingleTargetConnect(
+            socket_url, origin="https://minekuai.com", proxy=None,
+            open_timeout=min(10, total_timeout), close_timeout=2, max_size=256 * 1024,
+            max_queue=16, logger=_TRANSPORT_LOGGER,
+        ) as ws:
+            auth_deadline = min(deadline, loop.time() + AUTH_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                ws.send(json.dumps({"event": "auth", "args": [ws_token]})),
+                timeout=min(SEND_TIMEOUT_SECONDS, max(0, auth_deadline - loop.time())),
+            )
+            authenticated = False
+            quiet_since = None
+            while True:
+                receive_deadline = deadline if authenticated else auth_deadline
+                if quiet_since is not None:
+                    receive_deadline = min(receive_deadline, quiet_since + stable_offline_seconds)
+                try:
+                    event, args = await _receive_event(ws, receive_deadline)
+                except asyncio.TimeoutError:
+                    if (
+                        authenticated and quiet_since is not None
+                        and loop.time() >= quiet_since + stable_offline_seconds
+                        and loop.time() < deadline
+                    ):
+                        return {"state": "offline", "stable_offline": True}
+                    raise
+                if event in {"jwt error", "token expiring", "token expired"}:
+                    raise PreSendAuthError("面板实时状态认证已失效")
+                if event == "daemon error":
+                    raise PowerTransportError("节点报告错误，无法确认实例实时状态")
+                if event == "auth success" and not authenticated:
+                    authenticated = True
+                    await asyncio.wait_for(
+                        ws.send(json.dumps({"event": "send stats", "args": [None]})),
+                        timeout=min(SEND_TIMEOUT_SECONDS, max(0, deadline - loop.time())),
+                    )
+                    continue
+                if not authenticated:
+                    continue
+                if event in {"install started", "install output", "install pull progress", "install completed"}:
+                    raise PowerTransportError("节点存在安装或镜像处理活动，不能确认实例可安装")
+                if event in {"console output", "daemon message"}:
+                    if quiet_since is not None:
+                        quiet_since = loop.time()
+                    continue
+                state = _live_state(event, args)
+                if state in {"starting", "running", "stopping"}:
+                    return {"state": state, "stable_offline": False}
+                if state == "offline" and quiet_since is None:
+                    quiet_since = loop.time()
+
+    try:
+        return await asyncio.wait_for(observe(), timeout=total_timeout)
+    except (PreSendAuthError, PowerTransportError):
+        raise
+    except Exception:
+        raise PowerTransportError(
+            "实时状态连接、认证或观察超时，未确认实例持续离线",
+        ) from None
 
 
 async def send_power(socket_url: str, ws_token: str, signal: str) -> dict:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import re
+from loguru import logger
 
 try:
     from .client import AuthError, MinekuaiError
@@ -98,7 +99,23 @@ class ModpackService:
                 lambda p: p.get_resources(identifier), panel=True, refresh=refresh)
             if resources.get("attributes", {}).get("current_state") != "offline":
                 raise ModpackError("请先停止实例再更换整合包；机器人不会替你强制杀进程")
+            if require_ready:
+                live = await self.live_state(server, identifier, refresh)
+                if live["state"] != "offline" or not live["stable_offline"]:
+                    raise ModpackError("实时控制台尚未确认持续离线，未提交安装")
         return server, identifier
+
+    async def live_state(self, server, identifier, refresh=None):
+        payload, _ = await self.read(server,
+            lambda p: p.get_live_state(identifier, stable_offline_seconds=3.0),
+            panel=True, refresh=refresh)
+        if (not isinstance(payload, dict)
+                or not isinstance(payload.get("state"), str)
+                or payload.get("state") not in {"offline", "starting", "running", "stopping"}
+                or type(payload.get("stable_offline")) is not bool
+                or (payload["state"] != "offline" and payload["stable_offline"])):
+            raise ModpackError("实时控制台运行状态格式异常，未提交安装")
+        return payload
 
     async def billing_active(self, server, identifier, refresh=None):
         """Only the exact card's exact instance can prove billing readiness."""
@@ -120,50 +137,66 @@ class ModpackService:
         return str(status) == "1"
 
     async def _wait_install_ready(self, identity, identifier, *, opened_billing,
-                                  authorized, refresh=None):
-        # Enabling billing can schedule a delayed game start. Initial offline
-        # alone isn't proof it has settled; observe that transition and stop it.
-        saw_active = not opened_billing
+                                  authorized, refresh=None, diagnostics=None):
+        # A start transition can be absent or too brief for HTTP polling.
+        # Require authenticated live offline observations instead of demanding
+        # that the instance must have been seen running first.
+        observed = diagnostics if diagnostics is not None else {}
         stop_sent = False
         offline_reads = 0
         for attempt in range(READY_ATTEMPTS):
+            observed.update(stage="读取计费状态", http=None, live=None, stable=None)
             server = self.current(identity)
             if not authorized():
                 raise ConfirmError("权限已变化，已停止安装流程")
             billing = await self.billing_active(server, identifier, refresh)
+            observed.update(billing=billing, stage="读取实例详情")
             server, found, attr = await self.instance_details(server, refresh)
             if found != identifier:
                 raise ModpackError("官网实例标识已变化，未提交安装")
-            if not billing or attr.get("is_suspended") or attr.get("status") == "suspended":
+            suspended = bool(attr.get("is_suspended") or attr.get("status") == "suspended")
+            observed["suspended"] = suspended
+            if not billing or suspended:
                 offline_reads = 0
             else:
+                observed["stage"] = "读取 HTTP 运行状态"
                 resources, server = await self.read(server,
                     lambda p: p.get_resources(identifier), panel=True, refresh=refresh)
                 resource_attr = resources.get("attributes") if isinstance(resources, dict) else None
                 state = resource_attr.get("current_state") if isinstance(resource_attr, dict) else None
-                if state not in {"offline", "starting", "running", "stopping"}:
+                if not isinstance(state, str) or state not in {"offline", "starting", "running", "stopping"}:
                     raise ModpackError("实例运行状态未知，未提交安装")
-                if state != "offline":
+                observed.update(http=state, stage="核对实时控制台")
+                live = await self.live_state(server, identifier, refresh)
+                observed.update(live=live["state"], stable=live["stable_offline"])
+                logger.info("[modpack] instance={} billing={} http={} live={} stable_offline={}",
+                            identifier, billing, state, live["state"], live["stable_offline"])
+                if live["state"] != "offline":
                     offline_reads = 0
                     if not opened_billing:
                         raise ModpackError("实例已被启动，请先停服后重新确认更换")
-                    saw_active = True
-                    if state in {"starting", "running"} and not stop_sent:
+                    if live["state"] in {"starting", "running"} and not stop_sent:
                         server = self.current(identity)
                         if not authorized():
                             raise ConfirmError("权限已变化，未发送停服指令")
                         stop_sent = True
+                        observed["stage"] = "正常停服"
                         # Keep billing on. This is a single graceful process
                         # stop, never a billing stop, start, kill, or retry.
                         async with self.build_panel(server) as panel:
                             await panel.power(identifier, "stop")
-                elif saw_active:
+                elif state == "offline" and live["stable_offline"]:
                     offline_reads += 1
                     if offline_reads >= 2:
                         return self.current(identity)
+                else:
+                    # A stale/disagreeing HTTP snapshot must not bypass the
+                    # live check, nor should it trigger a stop on an offline WS.
+                    offline_reads = 0
+                observed["stage"] = "等待 HTTP 与实时状态连续一致离线"
             if attempt + 1 < READY_ATTEMPTS:
                 await asyncio.sleep(READY_INTERVAL)
-        raise ModpackError("未确认开卡后的实例启动/停服已结束或持续离线，未提交安装")
+        raise ModpackError("未确认 HTTP 与实时控制台持续一致离线，未提交安装")
 
     async def validate_choice(self, server, choice, refresh=None):
         projects, _ = await self.search(server, choice.search_query, choice.search_page, refresh)
@@ -204,6 +237,7 @@ class ModpackService:
                 raise ConfirmError("权限已变化，本次确认已取消")
             self.cancel_background(server.name)
             self.maintenance.begin(pending.server, pending.choice)
+            diagnostics = {"billing": active, "stage": "开启计时卡"}
             try:
                 if progress:
                     await progress("正在开启计时卡（开始消耗时长），随后核对实例并正常停服..."
@@ -218,14 +252,16 @@ class ModpackService:
                         await client.start_timing(server.card_id, instance_id=identifier)
                 server = await asyncio.wait_for(self._wait_install_ready(
                     pending.server, identifier, opened_billing=not active,
-                    authorized=authorized, refresh=refresh,
+                    authorized=authorized, refresh=refresh, diagnostics=diagnostics,
                 ), timeout=READY_TIMEOUT)
                 if progress:
                     await progress("计时卡已开启且实例离线，正在复核并提交更换整合包...")
                 await self.validate_choice(server, pending.choice, refresh)
-                server, found = await self.preflight(server, refresh, require_ready=True)
-                if found != identifier or not await self.billing_active(server, identifier, refresh):
+                if not await self.billing_active(server, identifier, refresh):
                     raise ModpackError("实例标识或计费状态已变化，未提交安装")
+                server, found = await self.preflight(server, refresh, require_ready=True)
+                if found != identifier:
+                    raise ModpackError("实例标识已变化，未提交安装")
                 server = self.current(pending.server)
                 if not authorized():
                     raise ConfirmError("权限已变化，未提交安装")
@@ -233,7 +269,13 @@ class ModpackService:
                 self.maintenance.mark(pending.server.instance_uuid, "unknown")
                 if isinstance(exc, asyncio.CancelledError):
                     raise
-                reason = str(exc) if isinstance(exc, (MinekuaiError, ConfirmError)) else type(exc).__name__
+                if isinstance(exc, asyncio.TimeoutError):
+                    reason = (f"等待实例就绪超过 {READY_TIMEOUT:g} 秒；停在{diagnostics['stage']}，"
+                              f"计费={'已开启' if diagnostics.get('billing') else '未确认开启'}，"
+                              f"HTTP={diagnostics.get('http') or '未取得'}，"
+                              f"实时={diagnostics.get('live') or '未取得'}")
+                else:
+                    reason = str(exc) if isinstance(exc, (MinekuaiError, ConfirmError)) else type(exc).__name__
                 raise ModpackError(
                     f"开计时卡或安装前检查未完成：{reason}。未提交更换整合包；"
                     "计费可能已经开启，维护保护保留，请先到官网核对计费和实例状态；机器人不会自动关卡"
