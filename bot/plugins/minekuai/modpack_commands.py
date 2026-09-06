@@ -16,6 +16,10 @@ from .operations import OperationBusyError
 
 EXPECTED_ERRORS = (MinekuaiError, CatalogError, ConfirmError, MaintenanceError, OperationBusyError)
 CANCEL = {"取消", "cancel", "取消更换整合包"}
+INSTALL_OUTCOME_LABELS = {
+    "completed": "已确认完成", "failed": "平台报告失败",
+    "installing": "仍在安装中", "unknown": "尚未确认结果",
+}
 
 
 def scope_of(bot, event):
@@ -62,7 +66,13 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
         else:
             logger.error("整合包操作异常: {}", type(exc).__name__)
             message = "操作异常，请查看机器人日志或官网状态"
+        uncertain_install = (
+            installation and not isinstance(exc, ConfirmError)
+            and "未提交" not in message and "安装失败" not in message
+        )
         if installation:
+            if uncertain_install and "可能已受理" not in message:
+                message += "\n安装请求可能已受理，请用状态查询确认，不要再次提交。"
             warnings = []
             if not any(text in message for text in (
                 "维护保护保留", "维护保护会保留", "维护保护仍保留", "维护保护仍然保留",
@@ -77,7 +87,7 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             message += ("\n先用『整合包状态 <服务器>』并到官网核对安装与计费；"
                         "任务结束后手动关卡，再发『结束整合包维护 <服务器> 我已核对』。"
                         "请勿重复安装。")
-        await send_end(matcher, "❌ " + message)
+        await send_end(matcher, ("⚠️ " if uncertain_install else "❌ ") + message)
 
     async def session(matcher, bot, event, answer=""):
         await admin(matcher, event)
@@ -231,7 +241,18 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             await failed(matcher, exc, installation=True)
         audit(event.user_id, display_name(event), getattr(event, "group_id", None),
               f"switch_modpack {pending.server.name}", True, f"submitted item={pending.choice.item_id}")
-        await send_end(matcher, f"✅ 『{sanitize_display(pending.server.name)}』安装请求已提交，尚未确认完成。\n"
+        try:
+            entry = service.maintenance.get(pending.server.instance_uuid) or {}
+            outcome = entry.get("install_outcome", "unknown")
+        except Exception:
+            outcome = "unknown"
+            logger.warning("无法读取本次安装观察结果，请通过状态指令继续核对")
+        result_line = {
+            "completed": "✅ 本次维护期间的安装已确认完成；这不代表游戏已经启动或可以进入。",
+            "failed": "❌ 平台报告本次安装失败，请到官网检查，勿直接重复安装。",
+            "installing": "⏳ 安装请求已提交，平台仍在安装中。",
+        }.get(outcome, "⏳ 安装请求已提交，尚未确认完成，请用状态指令继续观察。")
+        await send_end(matcher, f"『{sanitize_display(pending.server.name)}』{result_line}\n"
             "维护保护已开启：机器人暂停该实例的开关服、重启、控制台和聊天桥写入。\n"
             "本次流程先开启计时卡，平台若自动启动则正常停服后再安装；没有主动发送游戏启动指令或强杀。\n"
             "计费可能仍在继续，机器人不会自动关卡，请到官网核对。\n"
@@ -254,19 +275,29 @@ def register_modpack_commands(*, servers, service, check_admin, refresh_factory,
             entry = service.maintenance.get(server.instance_uuid)
             if entry:
                 phase = {"preparing": "开卡或提交前/流程可能中断", "submitted": "请求已提交", "unknown": "请求结果不确定"}.get(entry["phase"], "未知")
-                lines.extend([f"维护保护：开启（{phase}，不代表安装成功）",
+                lines.extend([f"维护保护：开启（阶段记录：{phase}）",
                               f"本次选择：{entry['pack_name']} · {entry['pack_version']}"])
             else:
                 lines.append("维护保护：未开启（不代表当前安装状态）")
-            info, _ = await service.read(server, lambda p: p.get_server_info(server.instance_uuid),
-                panel=True, refresh=refresh_factory(matcher, event))
-            attr = info.get("attributes", {})
-            lines.append(f"官网实例状态：{sanitize_display(attr.get('status')) or '未标记安装任务'}")
-            lines.append(f"官网安装中：{'是' if attr.get('is_installing') else '否/未标记'}")
+            report = await service.install_status(server, refresh=refresh_factory(matcher, event))
+            if not isinstance(report, dict):
+                raise MinekuaiError("安装观察结果格式异常")
+            outcome = INSTALL_OUTCOME_LABELS.get(report.get("outcome"), INSTALL_OUTCOME_LABELS["unknown"])
+            lines.append(f"本次安装观察：{outcome}")
+            if report.get("detail"):
+                lines.append(sanitize_display(report["detail"], 320))
+            billing = report.get("billing_active")
+            if billing is True:
+                lines.append("计费：已开启，正在消耗时长。")
+            elif billing is False:
+                lines.append("计费：本次查询显示未开启。")
+            else:
+                lines.append("计费：尚未确认，可能仍在消耗时长，请到官网核对。")
         except Exception as exc:
             lines.append("官网查询未完成：" + (str(exc) if isinstance(exc, EXPECTED_ERRORS) else type(exc).__name__))
-        lines.append("这不是已安装整合包的识别结果；请在官网核对安装结果与文件。")
-        lines.append("计时卡可能已开启并继续计费；机器人不会自动关卡。请在官网核对，确认任务结束后手动关卡、解除维护保护。")
+            lines.append("计费状态也可能未确认，请到官网核对。")
+        lines.append("“本次选择”只是维护记录，不代表已识别当前整合包；请在官网核对实际文件与版本。")
+        lines.append("机器人不会自动关卡或解除维护保护。任务结束后按需手动关卡、解除保护；结果未知时继续查询，不要重新安装。")
         await send_end(matcher, "\n".join(lines))
 
     @finish.handle()

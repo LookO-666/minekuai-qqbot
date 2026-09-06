@@ -1,6 +1,9 @@
 """Safe orchestration for destructive modpack changes; no QQ dependencies."""
 from __future__ import annotations
 import asyncio
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import re
 from loguru import logger
 
@@ -21,6 +24,9 @@ class ModpackError(MinekuaiError):
 READY_ATTEMPTS = 31
 READY_INTERVAL = 2.0
 READY_TIMEOUT = 60.0
+INSTALL_TIMEOUT = 600.0
+INSTALL_INTERVAL = 5.0
+INSTALL_LOG_LIMIT = 256 * 1024
 
 
 class ModpackService:
@@ -135,6 +141,153 @@ class ModpackService:
         if type(status) not in (int, str) or status not in (0, 1, "0", "1"):
             raise ModpackError("目标实例的计费状态未知，未提交安装")
         return str(status) == "1"
+
+    async def _log_snapshot(self, server, refresh=None, *, read_content=True):
+        """Read only the known installer log, with a bounded file-size check."""
+        files, server = await self.read(server,
+            lambda p: p.list_directory(server.instance_uuid, "/"), panel=True, refresh=refresh)
+        if not isinstance(files, list):
+            raise ModpackError("安装日志目录格式异常")
+        found = [item for item in files if isinstance(item, dict)
+                 and item.get("name") == "installserverlogs.log"]
+        if not found:
+            return None
+        if len(found) != 1:
+            raise ModpackError("安装日志文件记录重复")
+        item = found[0]
+        if (item.get("is_file") is not True or item.get("is_symlink") is not False
+                or type(item.get("size")) is not int or item["size"] < 0):
+            raise ModpackError("安装日志不是普通文件，不能用于确认安装")
+        try:
+            modified = datetime.fromisoformat(item["modified_at"].replace("Z", "+00:00"))
+            if modified.tzinfo is None:
+                raise ValueError
+        except (ValueError, TypeError, AttributeError, KeyError):
+            raise ModpackError("安装日志时间格式未知，不能确认本次安装") from None
+        text = ""
+        if read_content and 0 < item["size"] <= INSTALL_LOG_LIMIT:
+            text, server = await self.read(server,
+                lambda p: p.read_file_text(server.instance_uuid, "/installserverlogs.log"),
+                panel=True, refresh=refresh)
+            if not isinstance(text, str) or len(text.encode("utf-8")) > INSTALL_LOG_LIMIT:
+                raise ModpackError("安装日志过大或格式异常，未确认完成")
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
+        stamp = json.dumps([item.get("created_at"), item["modified_at"], item["size"], digest],
+                           ensure_ascii=True, separators=(",", ":"))
+        return {"stamp": stamp, "modified_at": modified.timestamp(), "text": text,
+                "content_digest": digest}
+
+    @staticmethod
+    def _new_install_log(entry, snapshot):
+        if not entry or entry.get("write_started_at") == 0 or not snapshot:
+            return False
+        # NULL marks a pre-migration guard. Its creation time bounds the
+        # maintenance window but does not independently identify a catalog pack.
+        boundary = entry.get("write_started_at") or entry["created_at"]
+        baseline = entry.get("baseline_log_stamp")
+        if snapshot["modified_at"] < boundary or snapshot["stamp"] == baseline:
+            return False
+        if baseline:
+            try:
+                fields = json.loads(baseline)
+                if not isinstance(fields, list) or len(fields) != 4:
+                    return False
+                if fields[3] and fields[3] == snapshot["content_digest"]:
+                    return False
+            except (ValueError, TypeError):
+                return False
+        return True
+
+    async def install_status(self, server, refresh=None, *, include_billing=True):
+        """Reconcile uncertain receipts using fresh installer evidence; never replay writes."""
+        identity = ServerIdentity.from_server(server)
+        entry = self.maintenance.get(server.instance_uuid)
+        info, server = await self.read(server,
+            lambda p: p.get_server_info(server.instance_uuid), panel=True, refresh=refresh)
+        attr = info.get("attributes") if isinstance(info, dict) else None
+        if (not isinstance(attr, dict) or server.instance_uuid.casefold() not in {
+                str(attr.get("identifier") or "").casefold(), str(attr.get("uuid") or "").casefold()}):
+            raise ModpackError("安装查询的实例标识与绑定不一致")
+        outcome, detail = "unknown", "尚无足够证据确认本次安装结果，请勿重复安装"
+        if attr.get("is_installing") or attr.get("status") in {"installing", "reinstalling"}:
+            outcome, detail = "installing", "官网显示安装仍在进行中，请等待"
+        elif attr.get("status") in {"install_failed", "reinstall_failed"}:
+            # A pre-existing failure flag may remain briefly after a new POST.
+            # Do not end observation until this task has new installation evidence.
+            fresh_failure = not entry or entry.get("install_outcome") in {"installing", "failed"}
+            if fresh_failure:
+                outcome, detail = "failed", "官网显示安装失败，请检查安装日志；不会自动重复安装"
+            else:
+                detail = "官网仍显示失败状态，但尚未确认属于本次请求，继续观察新安装日志"
+        elif (entry and entry.get("write_started_at") != 0
+              and attr.get("status") in (None, "", "suspended")
+              and attr.get("is_installing") is False
+              and not any(attr.get(key) for key in (
+                  "is_transferring", "is_node_under_maintenance"))):
+            snapshot = await self._log_snapshot(server, refresh)
+            if self._new_install_log(entry, snapshot):
+                lines = snapshot["text"].strip().splitlines()
+                last = lines[-1].strip() if lines else ""
+                success = re.fullmatch(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] 整合包安装成功[!！]", last)
+                if success:
+                    try:
+                        # Minekuai's installer uses China time; file metadata is
+                        # ISO UTC. Validate both, including for old guards that
+                        # have no pre-write content digest after migration.
+                        finished_at = datetime.strptime(success[1], "%Y-%m-%d %H:%M:%S").replace(
+                            tzinfo=timezone(timedelta(hours=8))).timestamp()
+                        boundary = entry.get("write_started_at") or entry["created_at"]
+                        if not boundary <= finished_at <= snapshot["modified_at"] + 5:
+                            success = None
+                    except ValueError:
+                        success = None
+                if success:
+                    # Recheck after reading the log: an active/new task always
+                    # takes precedence over an earlier success line.
+                    latest, server = await self.read(server,
+                        lambda p: p.get_server_info(server.instance_uuid), panel=True, refresh=refresh)
+                    current = latest.get("attributes", {})
+                    if (current.get("identifier") == attr.get("identifier")
+                            and current.get("status") in (None, "", "suspended")
+                            and current.get("is_installing") is False
+                            and not any(current.get(key) for key in (
+                                "is_transferring", "is_node_under_maintenance"))):
+                        outcome, detail = "completed", "本次维护期间的新安装日志确认成功，官网已无进行中的安装任务"
+                    else:
+                        detail = "读取日志期间实例状态发生变化，暂不确认完成"
+        self.current(identity)
+        if entry:
+            self.maintenance.observe(entry, outcome)
+        billing = None
+        if include_billing:
+            try:
+                billing = await self.billing_active(server, str(attr.get("identifier") or ""), refresh)
+            except MinekuaiError:
+                pass
+        return {"outcome": outcome, "detail": detail, "billing_active": billing}
+
+    async def _wait_install_finished(self, identity, refresh=None):
+        """Observation expiry is not a failed install, and never causes a new POST."""
+        deadline = asyncio.get_running_loop().time() + INSTALL_TIMEOUT
+        while True:
+            server = self.current(identity)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return "unknown"
+            try:
+                result = await asyncio.wait_for(self.install_status(
+                    server, refresh, include_billing=False), timeout=min(45.0, remaining))
+                if result["outcome"] in {"completed", "failed"}:
+                    return result["outcome"]
+            except (MinekuaiError, asyncio.TimeoutError):
+                # Read-only polling can recover after a transient API outage.
+                # No response text or credentials enter the diagnostic log.
+                logger.info("[modpack] instance={} installation observation unavailable",
+                            identity.instance_uuid[:8])
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return "unknown"
+            await asyncio.sleep(min(INSTALL_INTERVAL, remaining))
 
     async def _wait_install_ready(self, identity, identifier, *, opened_billing,
                                   authorized, refresh=None, diagnostics=None):
@@ -265,6 +418,11 @@ class ModpackService:
                 server = self.current(pending.server)
                 if not authorized():
                     raise ConfirmError("权限已变化，未提交安装")
+                baseline = await self._log_snapshot(server, refresh)
+                self.current(pending.server)
+                if not authorized():
+                    raise ConfirmError("权限已变化，未提交安装")
+                self.maintenance.start_write(server.instance_uuid, baseline["stamp"] if baseline else "")
             except BaseException as exc:
                 self.maintenance.mark(pending.server.instance_uuid, "unknown")
                 if isinstance(exc, asyncio.CancelledError):
@@ -280,14 +438,34 @@ class ModpackService:
                     f"开计时卡或安装前检查未完成：{reason}。未提交更换整合包；"
                     "计费可能已经开启，维护保护保留，请先到官网核对计费和实例状态；机器人不会自动关卡"
                 ) from None
+            receipt_error = None
             try:
                 # The destructive request is deliberately OUTSIDE read().
                 async with self.build_client(server) as client:
                     await client.switch_modpack(identifier, pending.choice.file_name, pending.choice.item_id)
-            except BaseException:
+            except BaseException as exc:
                 self.maintenance.mark(pending.server.instance_uuid, "unknown")
-                raise
-            self.maintenance.mark(pending.server.instance_uuid, "submitted")
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                receipt_error = str(exc) if isinstance(exc, MinekuaiError) else type(exc).__name__
+            else:
+                self.maintenance.mark(pending.server.instance_uuid, "submitted")
+            if progress:
+                try:
+                    await progress("安装请求已发出，正在核对安装日志，可能需要几分钟。请勿重复安装。"
+                                   if receipt_error is None else
+                                   "安装接口未返回可确认的结果，但请求可能已受理。正在只读核对安装日志，请勿重复安装。")
+                except Exception:
+                    # A QQ send failure must not prevent observing the write.
+                    pass
+            outcome = await self._wait_install_finished(pending.server, refresh)
+            if outcome == "failed":
+                raise ModpackError("官网显示安装失败，维护保护保留；请查看整合包状态和官网安装日志，不会自动重试")
+            if outcome != "completed" and receipt_error is not None:
+                raise ModpackError(
+                    f"安装请求已发出，但结果未确认：{receipt_error}。"
+                    "只读观察暂未确认完成；请用『整合包状态』继续查询，不要重复安装"
+                )
             return pending
 
     async def finish_maintenance(self, server, *, authorized, refresh=None):

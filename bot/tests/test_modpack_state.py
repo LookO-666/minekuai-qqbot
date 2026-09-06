@@ -172,9 +172,14 @@ def test_begin_stores_only_required_public_metadata(state, store, server, choice
     assert row["pack_name"] == choice.name
     assert row["pack_version"] == choice.version
     assert row["server_created_at"] == server.created_at
+    assert row["write_started_at"] == 0
+    assert row["baseline_log_stamp"] == ""
+    assert row["install_outcome"] == "unknown"
+    assert len(row["attempt_id"]) == 32 and int(row["attempt_id"], 16) >= 0
     assert set(row) == {
         "instance_uuid", "card_id", "server_name", "server_created_at", "phase",
         "pack_name", "pack_version", "created_at", "updated_at",
+        "write_started_at", "baseline_log_stamp", "install_outcome", "attempt_id",
     }
     content = store.db_path.read_bytes()
     for secret in (server.token, server.account_phone, choice.file_name, choice.search_query):
@@ -340,3 +345,180 @@ def test_concurrent_begin_aliases_on_different_cards_are_atomic(state, store, se
         assert sorted(executor.map(begin, range(2))) == [False, True]
     with sqlite3.connect(store.db_path) as connection:
         assert connection.execute("SELECT count(*) FROM modpack_maintenance").fetchone()[0] == 1
+
+
+def test_schema_migration_preserves_legacy_unknown_write_boundary(state, tmp_path):
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("""CREATE TABLE modpack_maintenance (
+            instance_uuid TEXT PRIMARY KEY COLLATE NOCASE,
+            card_id TEXT NOT NULL UNIQUE, server_name TEXT NOT NULL,
+            server_created_at INTEGER NOT NULL, phase TEXT NOT NULL,
+            pack_name TEXT NOT NULL, pack_version TEXT NOT NULL,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+        connection.execute("INSERT INTO modpack_maintenance VALUES (?,?,?,?,?,?,?,?,?)",
+                           ("abcd1234", "old-card", "old-server", 1, "unknown", "Pack", "v1", 100, 200))
+    migrated = state.MaintenanceStore(path)
+    migrated.init_db()
+    migrated.init_db()  # Startup migration must be safe to run repeatedly.
+    entry = migrated.get("abcd1234")
+    assert entry["created_at"] == 100 and entry["updated_at"] == 200
+    assert entry["phase"] == "unknown" and entry["install_outcome"] == "unknown"
+    assert entry["write_started_at"] is None and entry["baseline_log_stamp"] is None
+    assert entry["attempt_id"] == ""
+    with pytest.raises(state.MaintenanceError):
+        migrated.start_write("abcd1234", "")
+    migrated.observe(entry, "completed")
+    assert migrated.get("abcd1234")["install_outcome"] == "completed"
+    with pytest.raises(state.MaintenanceError):
+        migrated.ensure_card_available("old-card")
+
+
+def test_start_write_is_durable_single_use_without_changing_phase(state, store, server, choice, monkeypatch):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    monkeypatch.setattr(state.time, "time", lambda: 1234567890)
+    store.start_write(server.instance_uuid.upper(), "public-log-metadata")
+    restarted = state.MaintenanceStore(store.db_path)
+    restarted.init_db()
+    entry = restarted.get(server.instance_uuid)
+    assert entry["write_started_at"] == 1234567890
+    assert entry["baseline_log_stamp"] == "public-log-metadata"
+    assert entry["phase"] == "preparing" and entry["install_outcome"] == "unknown"
+    with pytest.raises(state.MaintenanceError):
+        restarted.start_write(server.instance_uuid, "replacement-baseline")
+    assert restarted.get(server.instance_uuid) == entry
+
+
+@pytest.mark.parametrize("stamp", [None, True, 1, [], {}, "x" * 2049],
+                         ids=["none", "bool", "integer", "list", "dict", "too-long"])
+def test_start_write_invalid_baseline_never_marks_request_started(state, store, server, choice, stamp):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    with pytest.raises(state.MaintenanceError):
+        store.start_write(server.instance_uuid, stamp)
+    assert store.get(server.instance_uuid)["write_started_at"] == 0
+    assert store.get(server.instance_uuid)["baseline_log_stamp"] == ""
+
+
+@pytest.mark.parametrize("phase", ["submitted", "unknown"])
+def test_start_write_cannot_reenter_a_non_preparing_guard(state, store, server, choice, phase):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    store.mark(server.instance_uuid, phase)
+    with pytest.raises(state.MaintenanceError):
+        store.start_write(server.instance_uuid, "")
+    assert store.get(server.instance_uuid)["write_started_at"] == 0
+
+
+def test_start_write_missing_guard_fails_closed(state, store):
+    with pytest.raises(state.MaintenanceError):
+        store.start_write("missing", "")
+
+
+def test_concurrent_start_write_records_exactly_one_baseline(state, store, server, choice):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    barrier = threading.Barrier(2)
+
+    def start(index):
+        barrier.wait()
+        try:
+            state.MaintenanceStore(store.db_path).start_write(server.instance_uuid, f"baseline-{index}")
+            return index
+        except state.MaintenanceError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(start, range(2)))
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert store.get(server.instance_uuid)["baseline_log_stamp"] == f"baseline-{winners[0]}"
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "installing", "completed", "failed"])
+def test_observation_persists_outcome_but_never_releases_maintenance(state, store, server, choice, outcome):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    store.start_write(server.instance_uuid, "baseline")
+    store.mark(server.instance_uuid, "unknown")
+    original = store.get(server.instance_uuid)
+    store.observe(original, outcome)
+    restarted = state.MaintenanceStore(store.db_path)
+    restarted.init_db()
+    assert restarted.get(server.instance_uuid) == {**original, "install_outcome": outcome}
+    with pytest.raises(state.MaintenanceError):
+        restarted.ensure_card_available(server.card_id)
+
+
+@pytest.mark.parametrize("outcome", ["success", "submitted", "", None, True, 1])
+def test_invalid_observation_outcome_does_not_change_guard(state, store, server, choice, outcome):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    entry = store.get(server.instance_uuid)
+    with pytest.raises(state.MaintenanceError):
+        store.observe(entry, outcome)
+    assert store.get(server.instance_uuid) == entry
+
+
+@pytest.mark.parametrize("field,value", [
+    ("created_at", -1), ("write_started_at", -1), ("card_id", "different-card"),
+    ("instance_uuid", "another-instance"),
+    ("attempt_id", "stale-attempt"),
+])
+def test_observe_cannot_update_a_different_installation_window(state, store, server, choice, field, value):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    store.start_write(server.instance_uuid, "")
+    entry = store.get(server.instance_uuid)
+    with pytest.raises(state.MaintenanceError):
+        store.observe({**entry, field: value}, "completed")
+    assert store.get(server.instance_uuid) == entry
+
+
+def test_late_observation_cannot_resurrect_or_overwrite_new_guard(state, store, server, choice, monkeypatch):
+    identity = state.ServerIdentity.from_server(server)
+    monkeypatch.setattr(state.time, "time", lambda: 100)
+    store.begin(identity, choice)
+    store.start_write(server.instance_uuid, "old")
+    old = store.get(server.instance_uuid)
+    assert store.finish(server.instance_uuid)
+    with pytest.raises(state.MaintenanceError):
+        store.observe(old, "completed")
+    assert store.get(server.instance_uuid) is None
+    monkeypatch.setattr(state.time, "time", lambda: 200)
+    store.begin(identity, choice)
+    store.start_write(server.instance_uuid, "new")
+    with pytest.raises(state.MaintenanceError):
+        store.observe(old, "completed")
+    new = store.get(server.instance_uuid)
+    assert new["install_outcome"] == "unknown"
+    assert new["write_started_at"] == 200 and new["baseline_log_stamp"] == "new"
+
+
+def test_install_record_writes_fail_closed_without_schema(state, tmp_path):
+    store = state.MaintenanceStore(tmp_path / "missing.db")
+    with pytest.raises(state.MaintenanceError):
+        store.start_write("abcd1234", "")
+    with pytest.raises(state.MaintenanceError):
+        store.observe({"instance_uuid": "abcd1234", "created_at": 1, "card_id": "card"}, "unknown")
+
+
+def test_same_second_recreated_guard_has_distinct_attempt_id(state, store, server, choice, monkeypatch):
+    monkeypatch.setattr(state.time, "time", lambda: 100)
+    identity = state.ServerIdentity.from_server(server)
+    store.begin(identity, choice)
+    store.start_write(server.instance_uuid, "")
+    old = store.get(server.instance_uuid)
+    store.finish(server.instance_uuid)
+    store.begin(identity, choice)
+    store.start_write(server.instance_uuid, "")
+    new = store.get(server.instance_uuid)
+    assert old["created_at"] == new["created_at"] == old["write_started_at"] == new["write_started_at"]
+    assert old["attempt_id"] != new["attempt_id"]
+    with pytest.raises(state.MaintenanceError):
+        store.observe(old, "completed")
+    assert store.get(server.instance_uuid) == new
+
+
+@pytest.mark.parametrize("prior", ["installing", "completed", "failed"])
+def test_unknown_observation_keeps_prior_evidence_for_same_attempt(state, store, server, choice, prior):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    store.start_write(server.instance_uuid, "")
+    entry = store.get(server.instance_uuid)
+    store.observe(entry, prior)
+    store.observe(store.get(server.instance_uuid), "unknown")
+    assert store.get(server.instance_uuid)["install_outcome"] == prior

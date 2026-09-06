@@ -19,7 +19,7 @@ import json
 import re
 import unicodedata
 
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, quote_plus, unquote
 import httpx
 from loguru import logger
@@ -78,22 +78,91 @@ def _timeout_message(error: httpx.TimeoutException, service: str) -> str:
         return f"{service}连接繁忙，请稍后重试"
     return (
         f"等待{service}响应超时，操作结果尚未确认；"
-        "请先在网页确认状态，勿连续重复开关"
+        "请先在网页确认状态，勿连续重复操作"
     )
 
 
+def _request_service(path: str) -> str:
+    """Map known routes to fixed labels; never put path parameters in diagnostics."""
+    if path == "/system/mineKuaiMinecraft/v2/switchModpack":
+        return "整合包安装 API"
+    if path == "/system/modpacks/list":
+        return "整合包目录 API"
+    if path == "/system/timeBalance/user/userPackages" or re.fullmatch(
+        r"/system/timeBalance/user/(?:instance/[^/?#]+/(?:start|stop)|"
+        r"(?:startTiming|stopTiming)/[^/?#]+)", path,
+    ):
+        return "计时卡 API"
+    if re.fullmatch(r"/(?:panel|api/client)/servers(?:/[^?#]*)?", path):
+        return "面板 API"
+    return "麦块 API"
+
+
+_SAFE_CONTENT_TYPES = frozenset({
+    "application/json", "application/problem+json", "text/html",
+    "application/xhtml+xml", "text/plain", "application/octet-stream",
+})
+
+
+def _response_diagnostic(response: httpx.Response) -> str:
+    """Report only bounded categories, never response text or header values."""
+    media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    safe_media_type = media_type if media_type in _SAFE_CONTENT_TYPES else (
+        "other" if media_type else "missing"
+    )
+    prefix = response.content[:512].lstrip(b"\xef\xbb\xbf \t\r\n").lower()
+    if not response.content:
+        body_type = "empty"
+    elif media_type in ("text/html", "application/xhtml+xml") or prefix.startswith(
+        (b"<!doctype html", b"<html", b"<head", b"<body")
+    ):
+        body_type = "HTML"
+    else:
+        body_type = "other"
+    encrypted = "encrypt-key" in response.headers
+    redirected = 300 <= response.status_code < 400 or bool(response.history) or (
+        "location" in response.headers
+    )
+    return (
+        f"HTTP {response.status_code}, Content-Type={safe_media_type}, body={body_type}, "
+        f"encrypt-key={str(encrypted).lower()}, redirect={str(redirected).lower()}"
+    )
+
+
+def _response_error(response: httpx.Response, service: str, reason: str) -> APIError:
+    message = f"{service}{reason}（{_response_diagnostic(response)}）；未确认操作成功"
+    logger.warning(message)
+    return APIError(message)
+
+
+def _reject_redirect(response: httpx.Response, service: str) -> None:
+    if 300 <= response.status_code < 400 or response.history:
+        raise _response_error(response, service, "返回重定向响应")
+
+
 def _json_response(response: httpx.Response, service: str, *, allow_empty: bool = False) -> dict:
+    _reject_redirect(response, service)
     if allow_empty and response.status_code == 204 and not response.content:
         return {}
     try:
         data = response.json()
     except ValueError:
-        raise APIError(
-            f"{service}返回了网页或无效响应，可能遇到网站安全验证；未确认操作成功"
-        ) from None
+        raise _response_error(response, service, "返回非 JSON 响应") from None
     if not isinstance(data, dict):
-        raise APIError(f"{service}响应格式异常；未确认操作成功")
+        raise _response_error(response, service, "响应格式异常")
     return data
+
+
+def _http_error(
+    response: httpx.Response, service: str, sanitize: Callable[[Any], str],
+) -> MinekuaiError:
+    data = _json_response(response, service)
+    if data.get("code") in (401, "401", 419, "419"):
+        return AuthError(f"{service}认证失败，请更新认证信息")
+    message = data.get("msg") or data.get("message")
+    # Preserve friendly JSON API messages, not arbitrary HTML/error-page bodies.
+    detail = f": {sanitize(message)[:200]}" if isinstance(message, str) else ""
+    return APIError(f"{service}请求失败（{_response_diagnostic(response)}）{detail}；未确认操作成功")
 
 
 class MinekuaiClient:
@@ -151,22 +220,23 @@ class MinekuaiClient:
         if self._http is None:
             raise RuntimeError("Client 未初始化，请用 async with 进入上下文")
 
-        logger.debug(f"→ {method} {path}")
+        service = _request_service(path)
+        logger.debug(f"→ {service}")
         try:
-            r = await self._http.request(method, path, **kwargs)
+            r = await self._http.request(method, path, follow_redirects=False, **kwargs)
         except httpx.TimeoutException as e:
-            raise APIError(_timeout_message(e, "计时卡 API（api.minekuai.cn）")) from None
-        except httpx.HTTPError as e:
-            raise APIError(f"网络错误: {_safe_error_text(e, self._token)}") from None
+            raise APIError(_timeout_message(e, f"{service}（api.minekuai.cn）")) from None
+        except httpx.HTTPError:
+            raise APIError(f"{service}网络连接异常；未确认操作成功") from None
 
         if r.status_code in (401, 419):
-            raise AuthError("token 已过期或无效，请更新配置中的 MINEKUAI_TOKEN")
+            logger.warning(f"{service}认证失败（{_response_diagnostic(r)}）")
+            raise AuthError(f"{service} token 已过期或无效，请更新配置中的 MINEKUAI_TOKEN")
 
         if r.status_code >= 400:
-            detail = _safe_error_text(r.text, self._token)[:200]
-            raise APIError(f"HTTP {r.status_code}: {detail}")
+            raise _http_error(r, service, lambda value: _safe_error_text(value, self._token))
 
-        data = _json_response(r, "计时卡 API")
+        data = _json_response(r, service)
 
         if isinstance(data, dict) and "code" in data:
             code = data.get("code")
@@ -177,14 +247,14 @@ class MinekuaiClient:
                 # 业务码 401 也认作认证失败（HTTP 200 + body code=401，
                 # 麦块联机 token 过期/冻结时是这个形式）
                 if code in (401, 419, "401", "419"):
-                    raise AuthError("token 已过期或被冻结，请更新 MINEKUAI_TOKEN")
+                    raise AuthError(f"{service} token 已过期或被冻结，请更新 MINEKUAI_TOKEN")
                 # 500 + "操作太频繁" = 限流，通常意味着前一次操作刚完成
                 if code in (500, "500") and ("频繁" in msg or "稍后" in msg):
-                    raise RateLimitError(msg)
+                    raise RateLimitError(f"{service}: {msg}")
                 safe_code = _safe_error_text(code, self._token)
-                raise APIError(f"接口业务失败 [{safe_code}]: {msg}")
+                raise APIError(f"{service}业务失败 [{safe_code}]: {msg}")
 
-        logger.debug(f"← {r.status_code} {path}")
+        logger.debug(f"← {r.status_code} {service}")
         return data
 
     # ============================================================
@@ -260,7 +330,8 @@ class MinekuaiClient:
             json={"instanceId": instance_id, "fileName": file_name,
                   "id": modpack_id, "useExternalUrl": True},
         )
-        if result.get("code") not in (200, "200", 0, "0"):
+        code = result.get("code")
+        if type(code) not in (int, str) or code not in (200, "200", 0, "0"):
             raise APIError("更换整合包响应缺少成功业务码；结果未确认，请先在官网检查，勿重复安装")
         return result
 
@@ -286,7 +357,7 @@ class MinekuaiClient:
 
     async def open_timing_only(self, card_id: str, *, instance_id: str = "") -> None:
         """开启计费。实例电源状态由 PanelClient.start_instance 另行确认。"""
-        logger.info(f"[开服] 打开计时卡 {card_id}")
+        logger.info("[开服] 打开计时卡")
         try:
             await self.start_timing(card_id, instance_id=instance_id)
         except APIError as e:
@@ -298,7 +369,7 @@ class MinekuaiClient:
 
     async def close_server(self, card_id: str, *, instance_id: str = "") -> None:
         """关服流程：关闭计时卡（关闭计时卡后实例自动停止）"""
-        logger.info(f"[关服] 关闭计时卡 {card_id}")
+        logger.info("[关服] 关闭计时卡")
         await self.stop_timing(card_id, instance_id=instance_id)
         logger.info("[关服] 流程完成")
 
@@ -404,22 +475,23 @@ class PanelClient:
         if self._http is None:
             raise RuntimeError("PanelClient 未初始化，请用 async with 进入上下文")
 
-        logger.debug(f"→ [panel] {method} {path}")
+        logger.debug("→ 面板 API")
         try:
-            r = await self._http.request(method, path, **kwargs)
+            r = await self._http.request(method, path, follow_redirects=False, **kwargs)
         except httpx.TimeoutException as e:
-            raise APIError(_timeout_message(e, f"面板 API（{self.BASE_URL}）")) from None
-        except httpx.HTTPError as e:
-            raise APIError(f"面板网络错误: {self._error_text(e)}") from None
+            raise APIError(_timeout_message(e, "面板 API")) from None
+        except httpx.HTTPError:
+            raise APIError("面板 API 网络连接异常；未确认操作成功") from None
 
         if r.status_code in (401, 419):
+            logger.warning(f"面板 API 认证失败（{_response_diagnostic(r)}）")
             auth_type = self._auth_type()
             raise AuthError(
                 f"面板 {auth_type} 认证失败 (HTTP {r.status_code})"
             )
 
         if r.status_code >= 400:
-            raise APIError(f"面板 HTTP {r.status_code}: {self._error_text(r.text)[:200]}")
+            raise _http_error(r, "面板 API", self._error_text)
 
         data = _json_response(r, "面板 API", allow_empty=True)
 
@@ -446,7 +518,7 @@ class PanelClient:
             else:
                 raise APIError("新版面板响应数据格式异常；未确认操作成功")
 
-        logger.debug(f"← [panel] {r.status_code} {path}")
+        logger.debug(f"← {r.status_code} 面板 API")
         return data
 
     # ------------------------------------------------------------
@@ -494,7 +566,7 @@ class PanelClient:
 
     async def start_instance(self, instance_id: str) -> None:
         """启动服务器实例。"""
-        logger.info(f"[panel] power signal=start for {instance_id}")
+        logger.info("[panel] power signal=start")
         try:
             await self.power(instance_id, "start")
         except (AuthError, RateLimitError):
@@ -515,7 +587,7 @@ class PanelClient:
         要看的话得订阅 WebSocket 控制台（暂不实现）。
         """
         cmd = command.lstrip("/").strip()
-        logger.info(f"[panel] POST command to {instance_id}: {cmd[:60]}")
+        logger.info("[panel] POST command")
         await self._request(
             "POST", self._server_path(instance_id, "/command"),
             json={"command": cmd},
@@ -572,23 +644,26 @@ class PanelClient:
         """
         if self._http is None:
             raise RuntimeError("PanelClient 未初始化,请用 async with 进入上下文")
-        logger.debug(f"→ [panel] GET file {file_path} ({instance_id})")
+        logger.debug("→ 面板 API 读取文件")
         try:
             r = await self._http.get(
                 self._server_path(instance_id, "/files/contents"),
                 params={"file": file_path},
+                follow_redirects=False,
             )
         except httpx.TimeoutException as e:
-            raise APIError(f"读取文件超时: {self._error_text(file_path)}") from None
-        except httpx.HTTPError as e:
-            raise APIError(f"网络错误: {self._error_text(e)}") from None
+            raise APIError(_timeout_message(e, "面板 API（读取文件）")) from None
+        except httpx.HTTPError:
+            raise APIError("面板 API 读取文件网络异常") from None
         if r.status_code in (401, 419):
+            logger.warning(f"面板 API 认证失败（{_response_diagnostic(r)}）")
             auth_type = self._auth_type()
             raise AuthError(
                 f"面板 {auth_type} 认证失败 (HTTP {r.status_code})"
             )
         if r.status_code >= 400:
-            raise APIError(f"面板 HTTP {r.status_code}: {self._error_text(r.text)[:200]}")
+            raise _http_error(r, "面板 API", self._error_text)
+        _reject_redirect(r, "面板 API")
         if self._token:
             # The gateway can report business errors with HTTP 200 even
             # though a successful file response is raw text, not a JSON envelope.

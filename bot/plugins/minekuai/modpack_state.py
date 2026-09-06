@@ -180,6 +180,16 @@ class MaintenanceStore:
                         updated_at INTEGER NOT NULL
                     )
                 """)
+                # Additive migration keeps existing unknown attempts protected.
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(modpack_maintenance)")}
+                for name, definition in (
+                    ("write_started_at", "INTEGER"),
+                    ("baseline_log_stamp", "TEXT"),
+                    ("install_outcome", "TEXT NOT NULL DEFAULT 'unknown'"),
+                    ("attempt_id", "TEXT NOT NULL DEFAULT ''"),
+                ):
+                    if name not in columns:
+                        connection.execute(f"ALTER TABLE modpack_maintenance ADD COLUMN {name} {definition}")
         except (OSError, sqlite3.Error):
             raise MaintenanceError("无法初始化整合包维护保护，操作已停止") from None
 
@@ -199,11 +209,12 @@ class MaintenanceStore:
                 connection.execute(
                     """INSERT INTO modpack_maintenance
                     (instance_uuid, card_id, server_name, server_created_at, phase,
-                     pack_name, pack_version, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?)""",
+                     pack_name, pack_version, created_at, updated_at, write_started_at,
+                     baseline_log_stamp, install_outcome, attempt_id)
+                    VALUES (?, ?, ?, ?, 'preparing', ?, ?, ?, ?, 0, '', 'unknown', ?)""",
                     (
                         server.instance_uuid, server.card_id, server.name, server.created_at,
-                        choice.name, choice.version, now, now,
+                        choice.name, choice.version, now, now, secrets.token_hex(16),
                     ),
                 )
         except sqlite3.IntegrityError:
@@ -226,6 +237,40 @@ class MaintenanceStore:
                     raise MaintenanceError("找不到该实例的维护保护，操作已停止，请检查官网状态")
         except (OSError, sqlite3.Error):
             raise MaintenanceError("无法更新整合包维护保护，请检查官网状态") from None
+
+    def start_write(self, instance_id: str, baseline_log_stamp: str) -> None:
+        """Persist the one-shot write boundary before sending the installer POST."""
+        if not isinstance(baseline_log_stamp, str) or len(baseline_log_stamp) > 2048:
+            raise MaintenanceError("安装日志基线无效，未提交安装")
+        try:
+            with closing(self._connect()) as connection, connection:
+                changed = connection.execute(
+                    "UPDATE modpack_maintenance SET write_started_at=?, baseline_log_stamp=? "
+                    "WHERE instance_uuid=? AND phase='preparing' AND write_started_at=0",
+                    (int(time.time()), baseline_log_stamp, instance_id),
+                )
+                if changed.rowcount != 1:
+                    raise MaintenanceError("安装提交记录已变化，未重复提交安装")
+        except (OSError, sqlite3.Error):
+            raise MaintenanceError("无法记录安装提交边界，未提交安装") from None
+
+    def observe(self, entry: dict, outcome: str) -> None:
+        """Record read-only evidence without releasing protection or changing receipt state."""
+        if outcome not in {"unknown", "installing", "completed", "failed"}:
+            raise MaintenanceError("无效的安装观察状态")
+        try:
+            with closing(self._connect()) as connection, connection:
+                changed = connection.execute(
+                    "UPDATE modpack_maintenance SET install_outcome=CASE WHEN ?='unknown' "
+                    "THEN install_outcome ELSE ? END WHERE instance_uuid=? "
+                    "AND created_at=? AND card_id=? AND write_started_at IS ? AND attempt_id=?",
+                    (outcome, outcome, entry["instance_uuid"], entry["created_at"], entry["card_id"],
+                     entry.get("write_started_at"), entry.get("attempt_id", "")),
+                )
+                if changed.rowcount != 1:
+                    raise MaintenanceError("维护记录已变化，本次观察结果已丢弃，请重新查询")
+        except (OSError, sqlite3.Error):
+            raise MaintenanceError("无法保存安装观察结果，维护保护保留") from None
 
     def get(self, instance_id: str) -> dict | None:
         try:

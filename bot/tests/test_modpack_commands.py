@@ -126,6 +126,9 @@ def ui(monkeypatch):
         search=AsyncMock(return_value=((project,), 1)),
         versions=AsyncMock(return_value=((version,), 1)),
         read=AsyncMock(return_value=({"attributes": {"status": None, "is_installing": False}}, server)),
+        install_status=AsyncMock(return_value={
+            "outcome": "unknown", "detail": "暂无可确认的本次安装结果", "billing_active": None,
+        }),
         finish_maintenance=AsyncMock(),
     )
 
@@ -328,6 +331,7 @@ async def test_all_commands_require_current_admin_permission(ui, command, text):
     ui.service.prepare.assert_not_awaited()
     ui.service.confirm.assert_not_awaited()
     ui.service.read.assert_not_awaited()
+    ui.service.install_status.assert_not_awaited()
     ui.service.finish_maintenance.assert_not_awaited()
 
 
@@ -400,11 +404,12 @@ async def test_status_query_is_read_only_and_does_not_identify_completed_pack(ui
             "phase": phase, "pack_name": "Test Pack", "pack_version": "v1",
         }
     message = await invoke(ui, "status", "test")
-    assert "这不是已安装整合包的识别结果" in message
-    assert "请在官网核对安装结果与文件" in message
-    assert "计时卡可能已开启并继续计费" in message
+    assert "不代表已识别当前整合包" in message
+    assert "请在官网核对实际文件与版本" in message
+    assert "计费：尚未确认，可能仍在消耗时长" in message
     assert "不会自动关卡" in message
-    assert "不代表安装成功" in message if phase else "不代表当前安装状态" in message
+    assert "阶段记录" in message if phase else "不代表当前安装状态" in message
+    ui.service.install_status.assert_awaited_once()
     ui.service.confirm.assert_not_awaited()
     ui.service.finish_maintenance.assert_not_awaited()
 
@@ -533,3 +538,75 @@ async def test_partial_service_warnings_only_add_missing_safety_information(ui, 
     assert message.count("自动关卡") == 1
     assert "计费" in message
     assert "请勿重复安装" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome,expected", [
+    ("completed", "本次维护期间的安装已确认完成"),
+    ("failed", "平台报告本次安装失败"),
+    ("installing", "平台仍在安装中"),
+    ("unknown", "尚未确认完成"),
+])
+async def test_confirmation_result_uses_persisted_install_observation(ui, outcome, expected):
+    await choose_release(ui)
+    ui.service.maintenance.get.return_value = {"install_outcome": outcome}
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert expected in message
+    assert "维护保护已开启" in message
+    assert "不会自动关卡" in message
+    if outcome == "completed":
+        assert "这不代表游戏已经启动或可以进入" in message
+        assert "尚未确认完成" not in message
+    ui.service.finish_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_api_response_error_is_uncertain_not_claimed_install_failure(ui):
+    await choose_release(ui)
+    ui.service.confirm.side_effect = ui.commands.MinekuaiError("安装接口响应无法解析，结果未知")
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert message.startswith("⚠️")
+    assert "安装请求可能已受理" in message
+    assert "安装失败" not in message
+    assert "不要再次提交" in message
+    assert "整合包状态 <服务器>" in message
+
+
+@pytest.mark.asyncio
+async def test_explicit_platform_failure_is_not_downgraded_to_accepted(ui):
+    await choose_release(ui)
+    ui.service.confirm.side_effect = ui.commands.MinekuaiError("平台安装失败，请检查安装日志")
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert message.startswith("❌")
+    assert "平台安装失败" in message
+    assert "可能已受理" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome,label", [
+    ("completed", "已确认完成"), ("failed", "平台报告失败"),
+    ("installing", "仍在安装中"), ("unknown", "尚未确认结果"),
+])
+@pytest.mark.parametrize("billing,label_billing", [
+    (True, "计费：已开启，正在消耗时长"),
+    (False, "计费：本次查询显示未开启"),
+    (None, "计费：尚未确认，可能仍在消耗时长"),
+])
+async def test_install_status_displays_observed_result_and_billing_without_pack_detection(
+    ui, outcome, label, billing, label_billing,
+):
+    ui.service.install_status.return_value = {
+        "outcome": outcome,
+        "detail": "本次维护期间的安装日志确认成功" if outcome == "completed" else "本次安装观察说明",
+        "billing_active": billing,
+    }
+    message = await invoke(ui, "status", "test")
+    assert f"本次安装观察：{label}" in message
+    assert label_billing in message
+    assert "不代表已识别当前整合包" in message
+    assert "不会自动关卡或解除维护保护" in message
+    if outcome == "completed":
+        assert "本次维护期间的安装日志确认成功" in message
+    ui.service.install_status.assert_awaited_once()
+    ui.service.confirm.assert_not_awaited()
+    ui.service.finish_maintenance.assert_not_awaited()

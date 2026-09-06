@@ -353,7 +353,7 @@ async def test_auth_failure_never_includes_backend_message(panel, code, business
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("panel", [False, True])
-@pytest.mark.parametrize("kind", ["http", "business", "rate_limit"])
+@pytest.mark.parametrize("kind", ["http", "http_json", "business", "rate_limit"])
 async def test_error_text_redacts_configured_secrets_and_unrelated_jwt(panel, kind):
     other_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvdGhlciJ9.signature"
     secrets = ["ptlc_private-key", "private-session-value", "private-xsrf-value"] if panel else ["fake_token"]
@@ -362,6 +362,8 @@ async def test_error_text_redacts_configured_secrets_and_unrelated_jwt(panel, ki
     def handler(request):
         if kind == "http":
             return httpx.Response(502, text=detail)
+        if kind == "http_json":
+            return httpx.Response(502, json={"code": 502, "msg": detail})
         return httpx.Response(200, json={"code": 500 if kind == "rate_limit" else 503, "msg": detail})
 
     client = (
@@ -374,8 +376,12 @@ async def test_error_text_redacts_configured_secrets_and_unrelated_jwt(panel, ki
         with pytest.raises(RateLimitError if kind == "rate_limit" else APIError) as exc:
             await client._request("GET", "/test")
         text = str(exc.value)
-        assert "操作太频繁，请稍后再试" in text
-        assert "[REDACTED]" in text
+        if kind == "http":
+            assert "操作太频繁，请稍后再试" not in text
+            assert "HTTP 502" in text and "body=other" in text
+        else:
+            assert "操作太频繁，请稍后再试" in text
+            assert "[REDACTED]" in text
         for secret in secrets + [other_jwt]:
             assert secret not in text
         assert "eyJ" not in text
@@ -390,7 +396,7 @@ async def test_http_error_redacts_entire_secret_before_truncating(panel):
     detail = "x" * 180 + secret
 
     def handler(request):
-        return httpx.Response(500, text=detail)
+        return httpx.Response(500, json={"code": 500, "msg": detail})
 
     if panel:
         client = make_panel_client_with_mock(handler, api_key=secret)
@@ -443,10 +449,9 @@ async def test_file_http_errors_redact_credentials(status):
         with pytest.raises(AuthError if status in (401, 419) else APIError) as exc:
             await client.read_file_text("server-id", "server.properties")
         assert secret not in str(exc.value)
-        if status in (401, 419):
-            assert "file-error-detail" not in str(exc.value)
-        else:
-            assert "file-error-detail" in str(exc.value)
+        assert "file-error-detail" not in str(exc.value)
+        if status == 500:
+            assert "HTTP 500" in str(exc.value)
     finally:
         await client._http.aclose()
 
