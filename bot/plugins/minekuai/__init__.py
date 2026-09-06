@@ -266,7 +266,7 @@ async def _auto_start_locked(server: servers.Server) -> tuple[bool, str]:
                 server = servers.get_server(server.name) or server
 
         instance_msg = ""
-        if server.instance_uuid and server.account_phone:
+        if server.instance_uuid:
             async def _start(panel):
                 return await panel.start_instance(server.instance_uuid)
 
@@ -284,8 +284,6 @@ async def _auto_start_locked(server: servers.Server) -> tuple[bool, str]:
                 )
                 return False, f"计时卡已开启，但实例启动失败: {err}"
             instance_msg = "，实例启动指令已下达"
-        elif server.instance_uuid and not server.account_phone:
-            return False, "有实例 UUID 但未绑定账号，无法自动启动实例"
 
         servers.mark_server_started(server.name)
         idle_watcher.mark_opened(server.name)
@@ -374,18 +372,34 @@ def _build_client(server: servers.Server) -> MinekuaiClient:
     return MinekuaiClient(token=server.token, client_id=server.client_id)
 
 
-def _account_has_panel_auth(account: servers.Account) -> bool:
+def _account_has_panel_auth(account: servers.Account | None) -> bool:
     return bool(
-        account.panel_api_key
-        or (account.session_cookie and account.xsrf_token)
+        account and (
+            account.panel_api_key
+            or (account.session_cookie and account.xsrf_token)
+        )
     )
 
 
-def _build_panel_client(account: servers.Account) -> PanelClient:
+def _server_has_panel_token(server: servers.Server) -> bool:
+    return bool(server.token and server.client_id)
+
+
+def _has_panel_auth(
+    server: servers.Server, account: servers.Account | None,
+) -> bool:
+    return _server_has_panel_token(server) or _account_has_panel_auth(account)
+
+
+def _build_panel_client(
+    server: servers.Server, account: servers.Account | None = None,
+) -> PanelClient:
     return PanelClient(
-        api_key=account.panel_api_key,
-        session_cookie=account.session_cookie,
-        xsrf_token=account.xsrf_token,
+        token=server.token if _server_has_panel_token(server) else "",
+        client_id=server.client_id if _server_has_panel_token(server) else "",
+        api_key=account.panel_api_key if account else "",
+        session_cookie=account.session_cookie if account else "",
+        xsrf_token=account.xsrf_token if account else "",
     )
 
 
@@ -558,7 +572,7 @@ async def _refresh_token_for(
             account.phone, session_cookie, xsrf_token
         )
     else:
-        logger.warning("[refresh] 没拿到面板 cookies，下次开服可能要再登一次")
+        logger.debug("[refresh] 使用共享 JWT 面板鉴权，无需兼容 cookies")
     servers.mark_account_refreshed(account.phone)
     return True, "已刷新"
 
@@ -567,12 +581,16 @@ async def _ensure_panel_auth(
     server: servers.Server,
     verification_provider: auth.VerificationProvider | None = None,
 ) -> tuple[bool, str, servers.Server]:
-    """确保账号有可用的面板 API Key 或兼容 session。
+    """优先复用服务器 JWT，再回退到账号 API Key 或兼容 session。
 
     返回 (成功?, 状态消息, 重新读取后的 server)。
     """
+    # WS 控制台持有的 Server 快照可能早于其他调用刷新 JWT 的时间。
+    server = servers.get_server(server.name) or server
+    if _server_has_panel_token(server):
+        return True, "使用共享 JWT", server
     if not server.account_phone:
-        return False, "未绑定账号，没办法走面板接口", server
+        return False, "缺少 token/client_id 且未绑定账号，无法使用面板接口", server
     account = servers.get_account(server.account_phone)
     if not account:
         return False, f"绑定的账号 {server.account_phone} 不存在", server
@@ -588,8 +606,8 @@ async def _start_instance(
     event: MessageEvent,
     server: servers.Server,
 ) -> tuple[bool, str]:
-    """通过 panel POST /power signal=start 启动实例。
-    优先使用 Client API Key；兼容 session 失效时自动刷新一次。
+    """通过新版 WebSocket 或旧版 HTTP 面板电源协议启动实例。
+    优先使用共享 JWT；JWT 或兼容 session 失效时自动刷新一次。
     """
     if not server.instance_uuid:
         return False, "未配置 instance_uuid，跳过实例启动"
@@ -605,27 +623,30 @@ async def _start_instance(
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not _account_has_panel_auth(account):
+        if not _has_panel_auth(server, account):
             return False, "面板 API 凭据丢失"
 
         try:
-            async with _build_panel_client(account) as panel:
+            async with _build_panel_client(server, account) as panel:
                 await panel.start_instance(server.instance_uuid)
             return True, "start 信号已下达"
 
         except AuthError as e:
-            if account.panel_api_key:
+            if not _server_has_panel_token(server) and account and account.panel_api_key:
                 return False, f"面板 API Key 已失效或被撤销：{e}"
             if refresh_attempted:
                 return False, f"刷新后仍认证失败：{e}"
+            if not server.account_phone:
+                return False, f"面板 token 失效，请更新 token 或绑定账号后重试：{e}"
             refresh_attempted = True
             await matcher.send(
-                f"⏳ 面板兼容 session 失效，正在用账号 "
+                f"⏳ 面板登录凭据失效，正在用账号 "
                 f"{_mask_phone(server.account_phone)} 重新登录..."
             )
             ok, msg = await _refresh_token_for(server, verification_provider)
             if not ok:
                 return False, f"刷新失败：{msg}"
+            server = servers.get_server(server.name) or server
             continue
 
         except RateLimitError as e:
@@ -750,14 +771,14 @@ async def _start_server_locked(
     refresh_attempted = False
     while True:
         try:
-            # 第 1 步：开计时卡（Bearer JWT, api.minekuai.com）
+            # 第 1 步：开计时卡（Bearer JWT）
             async with _build_client(server) as client:
                 await client.open_timing_only(card_id=server.card_id)
 
-            # 第 2 步：实例启动（如果配了 uuid + 账号）
+            # 第 2 步：实例启动（复用 JWT，账号只用于自动续期）
             instance_msg = ""
             instance_started = False
-            if server.instance_uuid and server.account_phone:
+            if server.instance_uuid:
                 # 计时卡刚开，给后端 2 秒同步
                 import asyncio as _asyncio
                 await _asyncio.sleep(2)
@@ -772,11 +793,6 @@ async def _start_server_locked(
                         f"start {server.name}", True,
                         f"计时卡 OK, 实例失败: {msg}",
                     )
-            elif server.instance_uuid and not server.account_phone:
-                instance_msg = (
-                    f"\n实例 UUID 已配但未绑定账号，无法自动启动实例 "
-                    f"(发『绑定账号 {server.name} <手机号>』)"
-                )
             else:
                 instance_msg = (
                     f"\n实例 UUID 未配置，需手动启动 "
@@ -1408,7 +1424,7 @@ async def _add_step_uuid(
         "【5/5】请输入绑定的账号手机号\n"
         "\n"
         "📌 必须是已经『添加账号』添加进来的账号\n"
-        "📌 bot 会用这个账号自动登录获取 token、clientid 和 cookies\n"
+        "📌 bot 会用这个账号登录获取新版接口的 token 和 clientid\n"
         "    省去手填 token / clientid 的麻烦，token 失效也能自动刷新\n"
         "\n"
         "如果还没添加账号，先发『取消』，然后『添加账号』完成后再回来\n"
@@ -1503,7 +1519,7 @@ async def _add_finish(
         f"✅ 已添加服务器『{name}』，并绑定账号 {_mask_phone(account_phone)}！\n"
         f"{addr_hint}\n"
         f"{uuid_hint}\n"
-        f"token / clientid / cookies 都已自动获取。\n"
+        f"token / clientid 已获取，计时卡与新版面板共用。\n"
         f"现在可以发『开服 {name}』测试。"
     )
 
@@ -1579,7 +1595,7 @@ async def _uuid_update_step_name(
         "请输入新的实例 UUID\n"
         "\n"
         "📌 形如 e65b9139-938d-47fd-b7ab-8b59a6824c61\n"
-        "📌 从 minekuai.com F12 抓 /api/client/servers/XXX/ 那段\n"
+        "📌 从官网地址栏 /server/XXX 或接口 /panel/servers/XXX 提取\n"
         "\n"
         "发『清空』把 UUID 留空（回到只开计时卡模式）\n"
         "发『取消』中止"
@@ -1738,7 +1754,7 @@ async def _update_token_init(
         "🔍 怎么找：\n"
         "1. 浏览器重新登录 minekuai.com（旧 token 已失效）\n"
         "2. F12 → Network → 在页面上随便点点\n"
-        "3. 找任意 api.minekuai.com 请求 → Headers → Request Headers\n"
+        "3. 找 api.minekuai.cn 请求 → Headers → Request Headers\n"
         "4. 整行复制 authorization 那行（『Bearer 』前缀会自动去掉）\n"
         "\n"
         "发『取消』中止"
@@ -2318,13 +2334,13 @@ async def _mc_cmd(
             f"『{server_name}』没配实例 UUID,无法发指令。"
             f"发『修改uuid {server_name} <id>』先配上"
         )
-    if not server.account_phone:
+    if not server.account_phone and not _server_has_panel_token(server):
         await matcher.finish(
-            f"『{server_name}』没绑账号,无法发指令。"
+            f"『{server_name}』缺少 token/client_id 且没绑账号，无法发指令。"
             f"发『绑定账号 {server_name} <手机号>』"
         )
 
-    # 确保有 cookies
+    # 确保有共享 JWT 或兼容面板凭据
     verification_provider = _interactive_verification_provider(
         matcher, event, server.account_phone
     )
@@ -2341,11 +2357,11 @@ async def _mc_cmd(
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not _account_has_panel_auth(account):
+        if not _has_panel_auth(server, account):
             await matcher.finish("❌ 面板 API 凭据丢失")
 
         try:
-            async with _build_panel_client(account) as panel:
+            async with _build_panel_client(server, account) as panel:
                 await panel.send_command(server.instance_uuid, command)
             log_operation(
                 user_id, user_name, group_id,
@@ -2356,18 +2372,21 @@ async def _mc_cmd(
             )
 
         except AuthError as e:
-            if account.panel_api_key:
+            if not _server_has_panel_token(server) and account and account.panel_api_key:
                 await matcher.finish(f"❌ 面板 API Key 已失效或被撤销：{e}")
             if refresh_attempted:
                 await matcher.finish(f"❌ 鉴权后仍失败：{e}")
+            if not server.account_phone:
+                await matcher.finish("❌ 面板 token 失效，请更新 token 或绑定账号后重试")
             refresh_attempted = True
             await matcher.send(
-                f"⏳ 面板兼容 session 失效,用账号 "
+                f"⏳ 面板登录凭据失效，用账号 "
                 f"{_mask_phone(server.account_phone)} 刷新中..."
             )
             ok, msg = await _refresh_token_for(server, verification_provider)
             if not ok:
                 await matcher.finish(f"❌ 刷新失败：{msg}")
+            server = servers.get_server(server.name) or server
             continue
 
         except MatcherException:
@@ -2705,7 +2724,7 @@ async def _with_panel_refresh(
     server,
     fn,
 ):
-    """调 PanelClient 操作；API Key 优先，兼容 session 可自动刷新。
+    """调 PanelClient 操作；共享 JWT 优先，JWT/兼容 session 可自动刷新。
     返回 (result | None, err_msg, server)。
     """
     verification_provider = _interactive_verification_provider(
@@ -2720,20 +2739,22 @@ async def _with_panel_refresh(
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not _account_has_panel_auth(account):
+        if not _has_panel_auth(server, account):
             return None, "面板 API 凭据丢失", server
         try:
-            async with _build_panel_client(account) as panel:
+            async with _build_panel_client(server, account) as panel:
                 result = await fn(panel)
             return result, "ok", server
         except AuthError as e:
-            if account.panel_api_key:
+            if not _server_has_panel_token(server) and account and account.panel_api_key:
                 return None, f"面板 API Key 已失效或被撤销: {e}", server
             if refresh_attempted:
                 return None, f"刷新后仍认证失败: {e}", server
+            if not server.account_phone:
+                return None, "面板 token 失效，请更新 token 或绑定账号后重试", server
             refresh_attempted = True
             await matcher.send(
-                f"⏳ 面板兼容 session 失效,正在用账号 "
+                f"⏳ 面板登录凭据失效，正在用账号 "
                 f"{_mask_phone(server.account_phone)} 重新登录..."
             )
             ok, msg = await _refresh_token_for(server, verification_provider)
@@ -2750,7 +2771,8 @@ async def _with_panel_refresh(
 
 async def _panel_run_bg(server, fn):
     """后台(无 matcher)版的面板调用器,供 idle_watcher 注入使用。
-    API Key 优先；兼容 session 的 401/419 自动刷新。返回 (result | None, err_msg)。
+    共享 JWT 优先；JWT/兼容 session 的认证失效自动刷新一次。
+    返回 (result | None, err_msg)。
     """
     ok, msg, server = await _ensure_panel_auth(server)
     if not ok:
@@ -2758,20 +2780,22 @@ async def _panel_run_bg(server, fn):
     refresh_attempted = False
     while True:
         account = servers.get_account(server.account_phone)
-        if not account or not _account_has_panel_auth(account):
+        if not _has_panel_auth(server, account):
             return None, "面板 API 凭据丢失"
         try:
-            async with _build_panel_client(account) as panel:
+            async with _build_panel_client(server, account) as panel:
                 result = await fn(panel)
             return result, "ok"
         except AuthError as e:
-            if account.panel_api_key:
+            if not _server_has_panel_token(server) and account and account.panel_api_key:
                 return None, f"面板 API Key 已失效或被撤销: {e}"
             if refresh_attempted:
                 return None, f"刷新后仍认证失败: {e}"
+            if not server.account_phone:
+                return None, "面板 token 失效，请更新 token 或绑定账号后重试"
             refresh_attempted = True
             logger.info(
-                f"[panel-bg] {server.name} 兼容 session 失效,自动刷新"
+                f"[panel-bg] {server.name} 登录凭据失效，自动刷新"
             )
             ok, msg = await _refresh_token_for(server)
             if not ok:
@@ -3305,7 +3329,7 @@ async def _chat_relay(bot: Bot, event: MessageEvent):
     )
 
     for s in servers.list_servers():
-        if not (s.instance_uuid and s.account_phone):
+        if not (s.instance_uuid and (s.account_phone or _server_has_panel_token(s))):
             continue
         # 没人在线就不发,省请求也避免对离线服发指令
         if not idle_watcher.has_online_players(s.name):

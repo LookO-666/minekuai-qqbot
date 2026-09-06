@@ -421,7 +421,7 @@ async def _watch_loop() -> None:
 def _can_panel(s: servers.Server) -> bool:
     """该服务器是否具备走面板的条件(读日志/查资源)。"""
     return bool(
-        s.instance_uuid and s.account_phone
+        s.instance_uuid and (s.account_phone or (s.token and s.client_id))
         and _panel_runner is not None and _config is not None
     )
 
@@ -490,7 +490,10 @@ async def _check_keepalive(s: servers.Server) -> None:
     """6 天未启动的服务器自动短暂启动一次，避免服务商回收。"""
     if _start_callback is None or _close_callback is None:
         return
-    if not (s.card_id and s.instance_uuid and s.account_phone):
+    if not (
+        s.card_id and s.instance_uuid
+        and (s.account_phone or (s.token and s.client_id))
+    ):
         return
 
     task = _keepalive_tasks.get(s.name)

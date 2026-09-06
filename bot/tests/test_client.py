@@ -4,7 +4,9 @@
 """
 import importlib
 import sys
+import traceback
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -62,6 +64,33 @@ async def test_stop_timing_success():
 
     client = make_client_with_mock(handler)
     await client.stop_timing("12345")  # 不抛就算过
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation, args, method, path", [
+    ("get_user_packages", (), "GET", "/system/timeBalance/user/userPackages"),
+    ("start_timing", ("12345",), "POST", "/system/timeBalance/user/startTiming/12345"),
+    ("stop_timing", ("12345",), "POST", "/system/timeBalance/user/stopTiming/12345"),
+])
+async def test_timing_endpoints_use_migrated_api_host(operation, args, method, path):
+    calls = []
+    response = {"code": 200, "data": []}
+
+    def handler(request):
+        calls.append(request)
+        assert str(request.url) == f"https://api.minekuai.cn{path}"
+        assert request.method == method
+        assert request.headers["authorization"] == "Bearer fake_token"
+        assert request.headers["clientid"] == "fake_cid"
+        assert request.content == b""
+        return httpx.Response(200, json=response)
+
+    client = make_client_with_mock(handler)
+    try:
+        assert await getattr(client, operation)(*args) == response
+        assert len(calls) == 1
+    finally:
+        await client._http.aclose()
 
 
 @pytest.mark.asyncio
@@ -238,6 +267,8 @@ async def test_timing_timeout_is_clear_and_never_replays_post(error, expected):
         assert len(calls) == 1
         assert "private-card-id" not in str(exc.value)
         assert "internal detail" not in str(exc.value)
+        assert "api.minekuai.cn" in str(exc.value)
+        assert "api.minekuai.com" not in str(exc.value)
     finally:
         await client._http.aclose()
 
@@ -272,3 +303,136 @@ async def test_panel_accepts_empty_204_power_success():
         await client.start_instance("server-id")
     finally:
         await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("panel", [False, True])
+@pytest.mark.parametrize("code", [401, 419, "401", "419"])
+@pytest.mark.parametrize("business", [False, True])
+async def test_auth_failure_never_includes_backend_message(panel, code, business):
+    private_message = "remote-detail: credential must never be forwarded"
+
+    def handler(request):
+        return httpx.Response(
+            200 if business else int(code), json={"code": code, "msg": private_message},
+        )
+
+    client = (
+        make_panel_client_with_mock(handler, api_key="test-key")
+        if panel else make_client_with_mock(handler)
+    )
+    try:
+        with pytest.raises(AuthError) as exc:
+            await client._request("GET", "/test")
+        assert "remote-detail" not in str(exc.value)
+        assert private_message not in str(exc.value)
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("panel", [False, True])
+@pytest.mark.parametrize("kind", ["http", "business", "rate_limit"])
+async def test_error_text_redacts_configured_secrets_and_unrelated_jwt(panel, kind):
+    other_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvdGhlciJ9.signature"
+    secrets = ["ptlc_private-key", "private-session-value", "private-xsrf-value"] if panel else ["fake_token"]
+    detail = "操作太频繁，请稍后再试 " + " ".join(secrets + [other_jwt])
+
+    def handler(request):
+        if kind == "http":
+            return httpx.Response(502, text=detail)
+        return httpx.Response(200, json={"code": 500 if kind == "rate_limit" else 503, "msg": detail})
+
+    client = (
+        make_panel_client_with_mock(
+            handler, api_key=secrets[0], session_cookie=f"session={secrets[1]}; locale=zh_CN",
+            xsrf_token=secrets[2],
+        ) if panel else make_client_with_mock(handler)
+    )
+    try:
+        with pytest.raises(RateLimitError if kind == "rate_limit" else APIError) as exc:
+            await client._request("GET", "/test")
+        text = str(exc.value)
+        assert "操作太频繁，请稍后再试" in text
+        assert "[REDACTED]" in text
+        for secret in secrets + [other_jwt]:
+            assert secret not in text
+        assert "eyJ" not in text
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("panel", [False, True])
+async def test_http_error_redacts_entire_secret_before_truncating(panel):
+    secret = "private-secret-" * 30
+    detail = "x" * 180 + secret
+
+    def handler(request):
+        return httpx.Response(500, text=detail)
+
+    if panel:
+        client = make_panel_client_with_mock(handler, api_key=secret)
+    else:
+        client = make_client_with_mock(handler)
+        client._token = secret
+    try:
+        with pytest.raises(APIError) as exc:
+            await client._request("GET", "/test")
+        assert "private-secret" not in str(exc.value)
+        assert "[REDACTED]" in str(exc.value)
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["timing", "panel", "file"])
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
+async def test_network_error_traceback_does_not_leak_credentials(entrypoint, error_type):
+    secret = "ptlc_network-secret" if entrypoint != "timing" else "fake_token"
+
+    def handler(request):
+        raise error_type(f"connection failed: Authorization Bearer {secret}", request=request)
+
+    client = (
+        make_client_with_mock(handler) if entrypoint == "timing"
+        else make_panel_client_with_mock(handler, api_key=secret)
+    )
+    try:
+        with pytest.raises(APIError) as exc:
+            if entrypoint == "file":
+                await client.read_file_text("server-id", "server.properties")
+            else:
+                await client._request("GET", "/test")
+        assert secret not in str(exc.value)
+        assert secret not in "".join(traceback.format_exception(exc.type, exc.value, exc.tb))
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 419, 500])
+async def test_file_http_errors_redact_credentials(status):
+    secret = "ptlc_file-secret"
+    client = make_panel_client_with_mock(
+        lambda request: httpx.Response(status, text=f"file-error-detail {secret}"),
+        api_key=secret,
+    )
+    try:
+        with pytest.raises(AuthError if status in (401, 419) else APIError) as exc:
+            await client.read_file_text("server-id", "server.properties")
+        assert secret not in str(exc.value)
+        if status in (401, 419):
+            assert "file-error-detail" not in str(exc.value)
+        else:
+            assert "file-error-detail" in str(exc.value)
+    finally:
+        await client._http.aclose()
+
+
+def test_encoded_and_json_escaped_known_secrets_are_redacted():
+    secret = 'private+secret/="value"'
+    encoded = quote(secret, safe="")
+    escaped = secret.replace('"', '\\"')
+    text = client_mod._safe_error_text(f"detail {secret} {encoded} {escaped}", secret)
+    assert text == "detail [REDACTED] [REDACTED] [REDACTED]"

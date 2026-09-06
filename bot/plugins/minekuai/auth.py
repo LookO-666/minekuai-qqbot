@@ -27,6 +27,8 @@ from loguru import logger
 
 
 LOGIN_URL = "https://minekuai.com/login"
+# Public web application identifier, not an API secret.
+WEB_CLIENT_ID = "3991ee92fe77fa9672e5eca721151dab"
 DEFAULT_TIMEOUT_MS = 30_000
 # 实际登录响应路径——『账号登录』(密码) 和 『手机登录』(SMS) 走不同端点，
 # minekuai 历史上在 pterodactylLogin / pterodactylSMSLogin 之间反复横跳——
@@ -81,9 +83,8 @@ async def refresh_token(
     """用账号密码自动登录 minekuai.com。
 
     返回 4 元组：(token, client_id, session_cookie, xsrf_token)
-      - token / client_id: 调 api.minekuai.com 计时卡接口用（JWT Bearer 认证）
-      - session_cookie / xsrf_token: 调 minekuai.com/api/client/... 面板接口用
-        （Laravel session + CSRF 认证，用来开关服务器实例）
+      - token / client_id: 调 api.minekuai.cn 计时卡与新版面板接口
+      - session_cookie / xsrf_token: 仅用于旧版面板兼容，可为空
 
     失败抛 LoginError，调用方根据消息提示用户。
     """
@@ -230,17 +231,14 @@ async def _do_login(
             pass
 
     if not token:
-        raise LoginError(
-            f"登录成功但响应里没找到 token 字段: {json.dumps(data)[:300]}"
-        )
+        raise LoginError("登录成功但响应里没找到 token 字段，请检查官网登录状态")
 
     # clientid 没有单独字段——它嵌在 JWT payload 里
     # 服务端 校验时 header 的 clientid 必须跟 JWT 里的 clientid 一致
     if not client_id:
-        client_id = _extract_clientid_from_jwt(token) or ""
+        client_id = _extract_clientid_from_jwt(token) or WEB_CLIENT_ID
 
-    # Pterodactyl 面板还需要 session cookies + XSRF——
-    # 等几秒让前端跑完登录后的初始化（写 pterodactyl_session 等 cookie）
+    # 保留旧版 session 兼容信息；新版面板不依赖这些 cookies。
     await asyncio.sleep(2)
     session_cookie, xsrf_token = await _extract_panel_auth(context)
 
@@ -452,9 +450,9 @@ async def _extract_panel_auth(context) -> tuple[str, str]:
             break
 
     if not cookie_header:
-        logger.warning("[auth] 没拿到任何 minekuai cookie，面板 API 调用会失败")
+        logger.debug("[auth] 无旧版面板 cookie，新版面板使用 JWT")
     if not xsrf_raw:
-        logger.warning("[auth] 没找到 XSRF-TOKEN cookie，面板 API 调用会失败")
+        logger.debug("[auth] 无旧版 XSRF cookie，新版面板使用 JWT")
     return cookie_header, xsrf_raw
 
 

@@ -5,15 +5,15 @@
 
 [English](README.md) | 简体中文
 
-群里发一句 `开服`，bot 自动开 [麦块联机](https://minekuai.com) 的计时卡 **+** 启动服务器实例，全自动，玩家直接进。
+群里发一句 `开服`，bot 会请求开启 [麦块联机](https://minekuai.com) 的计时卡 **+** 启动 Minecraft 实例，并确认服务器就绪后再通知玩家进入。前提是账号有效、实例仍存在且接口可访问；登录可能需要人工验证。
 
-> **简短历程**：v1 只开计时卡；v2 加 token 自动续期；v3 用面板 session 自动启动实例；v4 改用 Pterodactyl Client API Key，面板控制不再依赖短期 cookies。**现在全自动**。
+> **当前接口迁移**：计时卡使用 `api.minekuai.cn`；新版面板通过同一账号的 JWT 和 `clientid` 访问 `api.minekuai.cn/panel/servers/...`。Pterodactyl Client API Key 与 session cookies 仅保留为旧版兼容方式，不是新版面板的默认认证。之前的实现见[更新历史](#更新历史)。
 
 ---
 
 ## 功能特性
 
-- **一键全自动开服**：同时开启计时卡和服务器实例，启动完成后自动在群里通知“可以进入”
+- **一键开服**：请求开启计时卡和服务器实例，确认启动就绪后在群里通知“可以进入”
 - **Minecraft ↔ QQ 双向聊天桥**：游戏聊天实时转到 QQ 群；群内普通文本通过 `tellraw` 转回有玩家在线的服务器
 - **实时事件播报**：通过 Pterodactyl WebSocket 监听控制台，播报玩家加入、离开、死亡和成就；WebSocket 不可用时回退轮询 `latest.log`
 - **玩家绑定与统计**：QQ 绑定游戏名后使用群昵称显示，并支持死亡/成就 @、在线时长榜和死亡榜
@@ -21,7 +21,7 @@
 - **智能后台管理**：空闲自动关停、60 秒可取消倒计时、临时暂停、6 天未启动自动保活
 - **资源告警**：CPU/内存持续超过阈值才通知管理员，带连续检测和告警冷却，避免刷屏
 - **多服务器**：一个 bot 可控制多台实例；查询可汇总，管理和运维可指定服务器
-- **自动认证**：计时卡 JWT 失效后通过 Playwright 自动续期；面板优先使用长期 Client API Key，兼容 session 回退
+- **认证恢复**：账号 JWT 失效后尝试通过 Playwright 续期，支持交互式图片／短信验证；网站安全验证可能需要人工完成。Client API Key/session 仅用于旧版面板兼容
 - **群内交互式配置**：通过指令添加账号和服务器，不必手改数据库或重启 bot
 - **安全持久化**：配置与统计存入 SQLite；token、密码、Client API Key 和会话凭据使用 Fernet 加密
 - **分级权限**：普通用户负责开关服、查询和玩家功能；管理员负责账号、服务器配置和高权限运维
@@ -79,7 +79,7 @@
 | 🔒 `添加账号` / `加账号` | 录入手机号和密码；密码加密保存 |
 | 🔒 `账号列表` | 查看打码手机号、绑定的服务器和面板认证方式 |
 | 🔒 `删除账号 <手机号>` | 删除账号并解除相关服务器绑定，需要确认 |
-| 🔒 `添加服务器` / `添加` | 5 步：名字、计时卡 ID、地址、实例 UUID、已有账号；token/clientid/session 自动获取 |
+| 🔒 `添加服务器` / `添加` | 5 步：名字、计时卡 ID、地址、实例 UUID、已有账号；尝试获取登录凭据，可能需要验证。这里只登记已有服务器，不创建麦块实例 |
 | 🔒 `删除服务器 <名字>` | 删除服务器，需要回复“确认” |
 | 🔒 `修改服务器名字 [旧 [新]]` | 修改服务器标签 |
 | 🔒 `修改地址 [名字 [地址]]` | 修改玩家连接地址 |
@@ -113,7 +113,7 @@
 | 自动保活 | 完整配置的服务器若约 6 天未启动，会先确认已离线，再开机运行约 5 分钟；失败或状态未知时至少退避 30 分钟 |
 | 资源告警 | CPU/内存连续超过配置阈值若干次才报警，重复告警受冷却时间限制并 @ 管理员 |
 | SLP 失败退避 | 后台探测连续失败按 30/60/120/300 秒退避；用户主动发送“在线”仍立即查询 |
-| 凭据自动恢复 | JWT 失效时自动登录刷新；面板 session 兼容模式失效时刷新一次；Client API Key 被撤销则明确报错 |
+| 凭据自动恢复 | 认证失效后尝试刷新共用的账号 JWT；图片／短信验证需要交互回复，网站安全验证可能需要人工完成。session 与 Client API Key 仅用于旧版兼容 |
 | 更新公告 | 若部署方写入 `bot-data/.changelog_to_send`，bot 下次连接后会向允许群发送一次并删除该文件 |
 
 多台服务器共用计时卡时，跳过自动保活和空闲自动关机，避免误关另一台实例。同一卡的手动开关操作不能并发；手动接管会取消尚在等待的保活自动关机。服务器名支持唯一的大小写兼容匹配（`atm` → `ATM`）；有歧义时必须输入精确名字。
@@ -134,28 +134,28 @@ NapCatQQ（QQ 协议端，挂机器人小号）
 nonebot2 + minekuai 插件（业务逻辑）
    │
    ├─ 第 1 步：开计时卡
-   │    HTTPS + JWT Bearer
-   │    api.minekuai.com/system/timeBalance/...
+   │    HTTPS + 账号 JWT Bearer + clientid
+   │    api.minekuai.cn/system/timeBalance/...
    │       │
    │       ├─ 401 → 服务器绑了账号？
    │       │       ↓ 是
-   │       │      Playwright 无头 Chromium 登录 minekuai.com
-   │       │      → 拿到新 JWT + clientid（并保留兼容 cookies）
-   │       │      → 写回 DB → 重试
+   │       │      Playwright 尝试登录 minekuai.com
+   │       │      → 可能需要图片／短信回复，或人工完成网站验证
+   │       │      → 成功后保存新 JWT + clientid，再重试
    │       │
    │       └─ 200 → 计时卡开启成功
    │
    └─ 第 2 步：启动服务器实例（如果配了 uuid + 账号）
-        HTTPS + Pterodactyl Client API Key（Authorization: Bearer ptlc_...）
-        POST minekuai.com/api/client/servers/<id>/power {"signal":"start"}
+        HTTPS + 同一账号 JWT Bearer + clientid
+        api.minekuai.cn/panel/servers/...
            │
-           ├─ API Key 未配置 → 兼容 session cookies + X-XSRF-TOKEN
+           ├─ 仅旧版面板兼容 → Client API Key 或 session cookies + X-XSRF-TOKEN
            │
-           └─ 204 → 启动信号下达，30-60 秒后服务器可进
+           └─ 请求被接受 → 另行检测 Minecraft 是否已经就绪
 
            SQLite (bot-data/operation_log.db)
            ├── servers 表       — 服务器配置（card_id / instance_uuid / 绑定账号）
-           ├── accounts 表      — 手机号 / 密码 / 加密的 Client API Key / 兼容 session
+           ├── accounts 表      — 手机号 / 密码 / 登录信息 / 旧版 API Key 与 session
            └── operation_log 表 — 谁在何时操作了什么
 ```
 
@@ -305,10 +305,10 @@ bot 会问 2 个问题：手机号（minekuai 登录用的）+ 密码。密码�
 5 步交互式询问：
 
 - **服务器名字**：用于指令操作的标签，例如 `GTNH`
-- **计时卡 ID**：F12 → 任意 `api.minekuai.com/system/timeBalance/.../startTiming/XXX` 那串纯数字
+- **计时卡 ID**：控制台只读请求 `api.minekuai.cn/system/timeBalance/user/userPackages` 中对应计时卡的 ID，或已经抓到的 `startTiming/XXX` 请求末尾数字
 - **连接地址**：麦块联机控制台显示的玩家连接地址
 - **实例 ID**：浏览器控制台 URL `minekuai.com/server/XXX` 里的 XXX（如 `420d4426`）
-- **已有账号**：选择先前添加的账号；token、clientid 和面板认证信息会自动获取
+- **已有账号**：选择先前添加的账号；bot 尝试取得新版计时卡和面板共用的 JWT、clientid，必要时提示完成验证
 
 群里发：
 
@@ -316,29 +316,29 @@ bot 会问 2 个问题：手机号（minekuai 登录用的）+ 密码。密码�
 开服 GTNH
 ```
 
-当前部署的绑定账号已配置 Client API Key，开服时直接走 Bearer 鉴权，通常 2-3 秒即可下达实例启动信号。Playwright 仅在计时卡 JWT 失效时用于自动续期。
+新版计时卡和面板共用账号 JWT 与 clientid。登录恢复可能要求输入图片／短信验证码，或由本人在浏览器完成网站安全验证；启动耗时取决于远端服务和 Minecraft 实例。机器人不会自动创建实例、购买套餐或给计时卡充值。
 
 ---
 
 ## token / clientid / 计时卡 ID / 实例 ID 怎么抓
 
-新部署的交互式配置通常只需手动查计时卡 ID 和实例 ID，token 与 clientid 会自动获取。如需排查或手动恢复：
+新部署的交互式配置通常只需手动查计时卡 ID 和实例 ID，bot 会尝试在登录时取得 token 与 clientid。如需排查或手动恢复：
 
 1. 浏览器登录 https://minekuai.com
 2. 进想要控制的服务器控制台页面（URL 形如 `minekuai.com/server/420d4426`）
 3. F12 → **Network**（网络）标签
-4. 点页面上的"启动"或"关闭"按钮（让网络面板出现请求）
+4. 打开或刷新控制台／实例页面，查看只读请求；不必为了查 ID 而实际开关服务器
 5. 找需要的字段：
 
 | 字段 | 怎么找 |
 |---|---|
-| `token` | 任意 `api.minekuai.com` 请求 → Request Headers → `authorization: Bearer eyJ...`（bot 会自动去掉 `Bearer ` 前缀） |
+| `token` | 已认证的 `api.minekuai.cn` 请求 → Request Headers → `authorization: Bearer eyJ...`（bot 会自动去掉 `Bearer ` 前缀）；不要向他人分享 |
 | `clientid` | 同上请求 Headers 里的 `clientid` 字段 |
-| `计时卡 ID` | URL 含 `startTiming` 或 `stopTiming` 的请求，URL 末尾的纯数字 |
-| `实例 ID` | 浏览器地址栏 `minekuai.com/server/XXX` 中的 XXX，或任意 `/api/client/servers/XXX/...` 请求的 XXX |
+| `计时卡 ID` | 控制台 `/system/timeBalance/user/userPackages` 响应中对应计时卡的 ID；也可看已经抓到的 `startTiming`／`stopTiming` URL 末尾数字 |
+| `实例 ID` | 浏览器地址栏 `minekuai.com/server/XXX`，或新版 `/panel/servers/XXX/...` 请求中的 XXX；旧版面板曾使用 `/api/client/servers/XXX/...` |
 | `地址` | 网页控制台右上角显示（玩家用的 IP:端口） |
 
-> token 失效之后**有自动续期，平时不用管**。如果 Minekuai 判定为非常用地点，Bot 会先发图片计算题，再请原操作人输入 6 位短信验证码。每次输入 5 分钟超时，只在内存中短暂传递，不写数据库或操作审计；建议私聊 Bot 回复。需要时仍可用 `更新token <名字>` 手动重粘。
+> token 失效后 bot 会尝试续期。如果 Minekuai 判定为非常用地点，Bot 会先发图片计算题，再请原操作人输入 6 位短信验证码。每次输入 5 分钟超时，只在内存中短暂传递，不写数据库或操作审计；建议私聊 Bot 回复。如果在进入登录表单之前就遇到网站安全页／滑块，需要本人在受影响的浏览器会话中完成验证。也可成功网页登录后，用 `更新token <名字>` 手动更新作为应急。
 
 ---
 
@@ -381,17 +381,26 @@ sqlite3 bot-data/operation_log.db \
 ```
 
 可能原因：
+
 - 账号密码错了 → `删除账号 <手机号>` + `添加账号` 重输
 - minekuai 改了登录页 UI → 我（bot 作者）需要调 Playwright 选择器
 - 触发非常用地点验证 → 按 Bot 提示依次回复 `图形验证码 <答案>`、`短信验证码 <6位>`；只接受原操作人，建议私聊发送
-- Minekuai 换成滑块等尚未支持的验证 → 暂时用 `更新token <名字>` 手动应急
+- 网站安全页／滑块挡住登录表单 → 本人在受影响的浏览器会话中完成验证；或自行成功登录后用 `更新token <名字>` 应急。机器人不会自动解决网站安全验证
 
 ### 实例启动失败时
 
 报 `实例启动失败: xxx`：
-- `xxx` 是 `面板 API Key 已失效或被撤销` → 到 `https://minekuai.com/account/api` 重新创建 Client API Key
-- 未配置 API Key 时仍会回退到 session；session 的 `401/419` 会自动刷新一次
-- 其他错误 → 看 docker logs 里 `panel POST power` 那行的具体响应
+
+- 先确认绑定账号在官网仍能看到该实例，并核对 bot 保存的是当前计时卡 ID 和实例 ID
+- 新版面板使用账号 JWT 与 `clientid`；认证失败应恢复登录或更新 token，而不是重建旧版 Client API Key
+- 只有旧版面板兼容模式使用 Client API Key/session；确认正在使用该模式后，再到旧版账户页面更新相应凭据
+- 其他错误查看 Docker 日志中已脱敏的面板报错；不要把原始请求头、token 或 cookies 粘贴到群里或公开 Issue
+
+### 长期未开机导致旧实例被销毁时
+
+如果麦块已经删除长期未使用的实例，修改 bot 的接口域名或更新 token 都不能把它重新启动。先在官网确认实例是否存在；已被销毁时，需要账号所有者在官网重建，再在 bot 中登记／绑定**新的计时卡 ID 和实例 ID**，连接地址有变化也要同步更新。`添加服务器` 只是保存绑定，不会创建托管实例。若计时卡 ID 改变，可用 `删除服务器` 删除过期的 bot 配置，再用 `添加服务器` 登记新配置。
+
+机器人不能恢复被销毁实例的原世界与文件；如果另有独立备份，可自行恢复备份。机器人不会自动新建替代实例、购买套餐或充值。自动保活只能降低长期闲置风险，不能保证实例一定被保留，也不能恢复已删除的实例。
 
 ---
 
@@ -478,7 +487,7 @@ grep ALLOWED_GROUPS bot/.env
 
 **Q: 计时卡接口超时，或 API 返回网站安全验证页**
 
-连接 `api.minekuai.com` 超时代表机器人未能建立连接，不是密码错误，应检查机器人所在服务器的网络。等待响应超时则意味着操作结果未知，机器人不会自动重发开关请求。HTML／安全验证页也不会被当作 API 成功。面板 Client API Key 不能替代计时卡接口的网络访问。
+当前计时卡请求使用 `api.minekuai.cn`；新发起的计时卡请求仍指向 `api.minekuai.com` 说明 bot 仍是旧版本。连接超时代表机器人未能建立连接，不是密码错误，应检查机器人所在服务器的网络。等待响应超时则意味着操作结果未知，机器人不会自动重发开关请求。HTML／安全验证页也不会被当作 API 成功；网页登录安全验证可能需要人工完成。旧版面板 Client API Key 不能替代新版账号接口的访问。
 
 **Q: 镜像构建很慢**
 
@@ -499,7 +508,7 @@ X11/Xvfb 的坑。`docker-compose.yml` 里有一段 `entrypoint:` 覆盖（创�
 
 按下面顺序检查：
 
-1. 服务器已经填写实例 UUID 并绑定账号，面板 Client API Key 可用；
+1. 服务器仍存在，已填写当前实例 ID 并绑定账号，JWT 面板认证可用（使用旧版兼容模式时才检查对应旧凭据）；
 2. `EVENT_BROADCAST=true`、`CHAT_BRIDGE=true`，对应方向的 `CHAT_MC_TO_QQ` / `CHAT_QQ_TO_MC` 也为 `true`；
 3. 日志里能看到 `[ws] <服务器名> 实时控制台已连接`，或关闭实时模式后能读取 `/logs/latest.log`；
 4. 服务端使用标准英文加入、离开、死亡、成就和 `<玩家> 内容` 聊天日志格式；
@@ -566,18 +575,25 @@ docker compose --profile test run --rm test
 
 ## 更新历史
 
-### v4 (current) — Client API Key 面板鉴权
+### 2026-09 接口迁移（当前）
+
+- 计时卡迁移到 `api.minekuai.cn`，`startTiming` 和 `stopTiming` 路径不变
+- 新版面板 `/panel/servers/...` 使用同一账号 JWT 与 `clientid`；Client API Key/session 仅保留为旧版兼容
+- 增加计时卡套餐只读查询，对 API 错误中回显的凭据脱敏
+- 说明交互式／人工登录验证，以及托管平台已销毁实例时必须重建并重新绑定的限制
+
+### v4（历史版本）— Client API Key 面板鉴权
 
 - 面板控制优先使用账户页生成的 Pterodactyl Client API Key
 - API Key Fernet 加密存入 SQLite，不打印、不提交 Git
 - 保留 session cookies 作为未配置 API Key 时的兼容回退
-- 计时卡仍使用 `api.minekuai.com` JWT，失效时由 Playwright 自动续期
+- 当时计时卡使用 `api.minekuai.com` JWT，失效时由 Playwright 尝试续期
 
-### v3 — 全自动开服
+### v3（历史版本）— 实例自动启动
 
-- 加 **Playwright 无头 Chromium 自动登录**：JWT token 失效时用账号密码自动刷新，群友无感
+- 加 **Playwright 无头 Chromium 自动登录**：JWT token 失效时尝试用账号密码刷新
 - 加 **Pterodactyl 面板 cookies 管理**：调 `power` 端点用的 session 同步自动续期
-- 加 **实例自动启动**：开计时卡之后直接 `POST /api/client/servers/<id>/power {"signal":"start"}`，30-60 秒玩家就能进
+- 加 **实例自动启动**：开计时卡之后调用当时的 `POST /api/client/servers/<id>/power {"signal":"start"}`
 - 新指令：`添加账号` / `账号列表` / `删除账号` / `绑定账号` / `修改uuid`
 - DB 加 `accounts` 表 + `servers.instance_uuid` 列
 

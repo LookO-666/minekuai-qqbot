@@ -5,9 +5,9 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Send `开服` (start server) in a QQ group and the bot will start both the [Minekuai](https://minekuai.com) time card **and** the Minecraft server instance. Once the server is ready, players can join immediately.
+Send `开服` (start server) in a QQ group to request both the [Minekuai](https://minekuai.com) time card **and** Minecraft instance startup. The bot checks readiness before announcing that players can join. This requires a valid account, an existing instance, and reachable Minekuai services; login may require human verification.
 
-> **In short:** v1 only controlled time cards; v2 added automatic token renewal; v3 used a panel session to start instances; v4 switched to Pterodactyl Client API Keys, so panel control no longer depends on short-lived cookies. The entire start-up flow is now automated.
+> **Current API migration:** time-card requests use `api.minekuai.cn`; the current panel uses the same account JWT and `clientid` under `api.minekuai.cn/panel/servers/...`. Pterodactyl Client API Keys and session cookies remain legacy compatibility methods, not the default authentication for the migrated panel. Earlier approaches are documented in [History](#history).
 
 ---
 
@@ -21,7 +21,7 @@ Send `开服` (start server) in a QQ group and the bot will start both the [Mine
 - **Smart background management:** idle shutdown, a cancellable 60-second countdown, temporary suspension, and automatic keepalive for servers not started for six days
 - **Resource alerts:** notifies administrators only after CPU or memory stays above a threshold, with sustained checks and cooldowns to avoid spam
 - **Multiple servers:** controls multiple instances from one bot; status queries can be aggregated while administrative actions target a specific server
-- **Automatic authentication:** renews expired time-card JWTs with Playwright; prefers long-lived panel Client API Keys and retains session authentication as a compatibility fallback
+- **Authentication recovery:** attempts to renew expired account JWTs with Playwright; supports interactive image/SMS verification, while website security challenges may require manual browser verification. Client API Key/session support is retained for legacy panels
 - **Interactive setup in QQ:** administrators can add accounts and servers without editing the database or restarting the bot
 - **Encrypted persistence:** stores configuration and statistics in SQLite; encrypts tokens, passwords, Client API Keys, and session credentials with Fernet
 - **Role-based permissions:** regular users can start, stop, query, and use player features; administrators manage accounts, servers, and privileged operations
@@ -81,7 +81,7 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 | 🔒 `添加账号` / `加账号` | Store a Minekuai phone number and password; the password is encrypted. |
 | 🔒 `账号列表` | Show masked phone numbers, linked servers, and panel authentication methods. |
 | 🔒 `删除账号 <phone>` | Delete an account and unlink its servers after confirmation. |
-| 🔒 `添加服务器` / `添加` | Five-step setup: name, time-card ID, address, instance UUID, and an existing account. Token, client ID, and session data are obtained automatically. |
+| 🔒 `添加服务器` / `添加` | Five-step setup: name, time-card ID, address, instance UUID, and an existing account. The bot attempts to obtain login credentials; verification may be required. This registers an existing server, not a new Minekuai instance. |
 | 🔒 `删除服务器 <name>` | Delete a server after replying `确认` (confirm). |
 | 🔒 `修改服务器名字 [old [new]]` | Rename a server label. |
 | 🔒 `修改地址 [name [address]]` | Change a player connection address. |
@@ -115,7 +115,7 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 | Automatic keepalive | For a fully configured server not started for about six days, confirms it is offline before starting a five-minute keepalive cycle. Failures or unknown state defer another attempt for at least 30 minutes. |
 | Resource alerts | Requires CPU or memory to remain above its threshold for several checks before alerting; repeat alerts are rate-limited and mention administrators. |
 | SLP failure backoff | Background probes back off for 30, 60, 120, then 300 seconds after repeated failures. An explicit `在线` query still runs immediately. |
-| Credential recovery | Automatically signs in to renew an expired JWT. Refreshes a compatibility panel session once after a 401/419. Reports a revoked Client API Key explicitly. |
+| Credential recovery | Attempts to renew the shared account JWT after an authentication failure. Image/SMS login may need an interactive reply, and website security verification may require a person. Legacy sessions and Client API Keys are compatibility methods only. |
 | Update announcement | If the operator creates `bot-data/.changelog_to_send`, the bot sends its contents once after connecting and then removes the file. |
 
 Servers sharing one time card skip automatic keepalive and idle shutdown to avoid stopping another instance. Manual power operations on the same card cannot overlap; a manual operation cancels a pending keepalive shutdown. Server names accept a unique case-insensitive match (`atm` → `ATM`); ambiguous matches require the exact spelling.
@@ -136,28 +136,28 @@ NapCatQQ (QQ protocol client running a dedicated bot account)
 nonebot2 + Minekuai plugin (application logic)
    │
    ├─ Step 1: start the time card
-   │    HTTPS + JWT Bearer
-   │    api.minekuai.com/system/timeBalance/...
+   │    HTTPS + account JWT Bearer + clientid
+   │    api.minekuai.cn/system/timeBalance/...
    │       │
    │       ├─ 401 → is an account linked to this server?
    │       │       ↓ yes
-   │       │      Playwright signs in to minekuai.com with headless Chromium
-   │       │      → obtains a new JWT + client ID (and compatibility cookies)
-   │       │      → writes them to the database → retries
+   │       │      Playwright attempts sign-in at minekuai.com
+   │       │      → image/SMS reply or manual website verification may be needed
+   │       │      → on success, saves the new JWT + client ID and retries
    │       │
    │       └─ 200 → time card started
    │
    └─ Step 2: start the instance (when UUID + account are configured)
-        HTTPS + Pterodactyl Client API Key (Authorization: Bearer ptlc_...)
-        POST minekuai.com/api/client/servers/<id>/power {"signal":"start"}
+        HTTPS + the same account JWT Bearer + clientid
+        api.minekuai.cn/panel/servers/...
            │
-           ├─ no API Key → compatibility session cookies + X-XSRF-TOKEN
+           ├─ legacy panels only → Client API Key or session cookies + X-XSRF-TOKEN
            │
-           └─ 204 → start signal accepted; server is usually ready in 30–60 seconds
+           └─ accepted request → wait for a separate Minecraft readiness check
 
            SQLite (bot-data/operation_log.db)
            ├── servers       — server settings (card ID / instance UUID / linked account)
-           ├── accounts      — phone / password / encrypted Client API Key / compatibility session
+           ├── accounts      — phone / password / login metadata / legacy API Key and session
            └── operation_log — who performed each operation and when
 ```
 
@@ -307,10 +307,10 @@ Then add a server:
 The five prompts request:
 
 - **Name:** the label used in bot commands, such as `GTNH`
-- **Time-card ID:** the numeric suffix of an `api.minekuai.com/system/timeBalance/.../startTiming/XXX` request
+- **Time-card ID:** the existing card's ID from the dashboard's read-only `api.minekuai.cn/system/timeBalance/user/userPackages` response, or the numeric suffix of an existing `startTiming/XXX` request
 - **Address:** the Minecraft address shown in the Minekuai console
 - **Instance ID:** the value in `minekuai.com/server/XXX`, such as `420d4426`
-- **Account:** choose an account already added to the bot; token, client ID, and panel authentication are obtained automatically
+- **Account:** choose an account already added to the bot; the bot attempts to obtain the JWT and client ID used by both current APIs, with verification prompts when needed
 
 Now send:
 
@@ -318,29 +318,29 @@ Now send:
 开服 GTNH
 ```
 
-When the linked account has a Client API Key, panel control uses Bearer authentication and normally sends the instance start signal within two or three seconds. Playwright is only needed when the time-card JWT expires.
+Current time-card and panel operations use the account JWT and client ID. Login recovery may prompt for an image/SMS code or require a person to complete a website security challenge in a browser; startup time depends on the remote service and Minecraft instance. The bot does not create instances or purchase/recharge time cards.
 
 ---
 
 ## Finding the token, client ID, time-card ID, and instance ID
 
-Most new deployments only need the time-card ID and instance ID during interactive setup; token and client ID are obtained automatically. To inspect or recover them manually:
+Most new deployments only need the time-card ID and instance ID during interactive setup; the bot attempts to obtain the token and client ID during login. To inspect or recover them manually:
 
 1. Sign in at <https://minekuai.com>.
 2. Open the target server console, whose URL resembles `minekuai.com/server/420d4426`.
 3. Open browser developer tools and select **Network**.
-4. Click **Start** or **Stop** on the page to create requests.
+4. Open or refresh the dashboard/instance page to capture read-only requests. There is no need to start or stop a server just to inspect its identifiers.
 5. Find the relevant value:
 
 | Field | Where to find it |
 |---|---|
-| `token` | Any `api.minekuai.com` request → Request Headers → `authorization: Bearer eyJ...`. The bot removes the `Bearer ` prefix automatically. |
+| `token` | An authenticated `api.minekuai.cn` request → Request Headers → `authorization: Bearer eyJ...`. The bot removes the `Bearer ` prefix automatically. Never share this value. |
 | `clientid` | The `clientid` header in the same request. |
-| Time-card ID | The numeric suffix of a request URL containing `startTiming` or `stopTiming`. |
-| Instance ID | The `XXX` in `minekuai.com/server/XXX`, or in `/api/client/servers/XXX/...`. |
+| Time-card ID | The matching card in the dashboard's `/system/timeBalance/user/userPackages` response, or the numeric suffix of an already captured `startTiming`/`stopTiming` URL. |
+| Instance ID | The `XXX` in `minekuai.com/server/XXX`, or the current `/panel/servers/XXX/...` requests. Legacy panels used `/api/client/servers/XXX/...`. |
 | Address | The player-facing host and port shown in the web console. |
 
-Expired tokens are normally renewed automatically. If Minekuai flags the login as an unusual location, the bot sends the image arithmetic challenge and then asks the original requester for the six-digit SMS code. Each answer expires after five minutes, is held only in memory, and is not written to the database or operation audit. Use `更新token <name>` only as a manual fallback.
+The bot attempts to renew expired tokens. If Minekuai flags the login as an unusual location, the bot sends the image arithmetic challenge and then asks the original requester for the six-digit SMS code. Each answer expires after five minutes, is held only in memory, and is not written to the database or operation audit. A website security page or slider can block access before this login flow; a person must complete that verification in the affected browser session. Use `更新token <name>` as a manual fallback with a token from a successful login.
 
 ---
 
@@ -387,15 +387,22 @@ Possible causes:
 - The account password is wrong: run `删除账号 <phone>` and add it again with `添加账号`.
 - Minekuai changed its sign-in UI: the Playwright selectors need to be updated.
 - An unusual-location login was triggered: follow the bot's `图形验证码` and `短信验证码` prompts. Only the original requester is accepted; replying in a private message is recommended.
-- Minekuai introduced a different challenge such as a slider: use `更新token <name>` as a temporary manual fallback.
+- A website security page or slider blocks the login form: complete it manually in the affected browser session. Alternatively, after successfully signing in yourself, use `更新token <name>` as a temporary fallback. The bot does not solve website security challenges automatically.
 
 ### When instance startup fails
 
 If the bot reports `instance startup failed: xxx`:
 
-- If `xxx` says the panel API Key is invalid or revoked, create a new Client API Key at <https://minekuai.com/account/api>.
-- Accounts without an API Key fall back to a session; a session 401/419 triggers one automatic refresh.
-- For other errors, inspect the `panel POST power` response in the Docker logs.
+- Check that the linked account can see the target instance on the website and that the bot has its current time-card ID and instance ID.
+- The migrated panel uses the account JWT and `clientid`; an authentication failure requires login recovery or a current token, not a replacement legacy Client API Key.
+- Only legacy panel mode uses Client API Keys or session cookies. Refresh/revoke those credentials through the legacy account page if that mode is actually in use.
+- For other errors, inspect the sanitized panel error in the Docker logs. Do not paste raw request headers, tokens, or cookies into a group or public issue.
+
+### When an old instance has been destroyed
+
+An instance removed by Minekuai after a long period of inactivity cannot be revived by changing the bot's API URL or renewing its token. Check the website first. If the instance no longer exists, its owner must recreate it on Minekuai, then register/rebind the **new time-card ID and instance ID** in the bot, and update the connection address if it changed. `添加服务器` only stores a binding; it does not provision hosting. If the card ID changed, delete the obsolete bot binding with `删除服务器` and add the new one with `添加服务器`.
+
+The bot cannot recover the destroyed instance's original world or files; restore an independent backup if one is available. It does not automatically create a replacement instance, purchase a plan, or recharge a card. Keepalive reduces inactivity risk but cannot guarantee retention or restore an already deleted instance.
 
 ---
 
@@ -483,7 +490,7 @@ The backend is rate-limiting requests. This does not confirm whether the request
 
 **The time-card API times out, or an API returns a website verification page.**
 
-A connection timeout to `api.minekuai.com` means the bot could not connect, not that the password is wrong. Check connectivity from the bot host. A response timeout leaves the operation's result unknown; the bot does not replay power requests automatically. HTML/security challenge pages are rejected rather than reported as successful API calls. A panel Client API Key does not replace time-card API access.
+Current time-card requests use `api.minekuai.cn`; a new time-card request still targeting `api.minekuai.com` indicates an old bot build. A connection timeout means the bot could not connect, not that the password is wrong. Check connectivity from the bot host. A response timeout leaves the operation's result unknown; the bot does not replay power requests automatically. HTML/security challenge pages are rejected rather than reported as successful API calls. Website login verification may need a person, and a legacy panel Client API Key does not replace access to the current account APIs.
 
 **The image builds slowly.**
 
@@ -505,7 +512,7 @@ This is usually an X11/Xvfb conflict. The `entrypoint` override in `docker-compo
 
 Check the following:
 
-1. The server has an instance UUID and linked account, and its panel Client API Key works.
+1. The server still exists, has the current instance ID and linked account, and its JWT-based panel access works (or the configured legacy credentials work in legacy mode).
 2. `EVENT_BROADCAST=true`, `CHAT_BRIDGE=true`, and the relevant `CHAT_MC_TO_QQ` or `CHAT_QQ_TO_MC` direction is enabled.
 3. Logs show `[ws] <server> real-time console connected`, or `latest.log` is readable when real-time mode is disabled.
 4. The server emits standard English join, leave, death, advancement, and `<player> message` chat lines.
@@ -574,16 +581,23 @@ Never commit `.env`, the SQLite database, tokens, cookies, phone numbers, passwo
 
 ## History
 
-### v4 (current) — Client API Key panel authentication
+### 2026-09 API migration (current)
 
-- Prefers a Pterodactyl Client API Key created from the Minekuai account page.
-- Encrypts API Keys with Fernet in SQLite and never prints or commits them.
-- Retains session cookies as a compatibility fallback when an API Key is not configured.
-- The time-card API still uses a JWT from `api.minekuai.com`, renewed by Playwright when necessary.
+- Moves time-card requests to `api.minekuai.cn`; the `startTiming` and `stopTiming` paths are unchanged.
+- Uses the shared account JWT and `clientid` for the current panel under `/panel/servers/...`; keeps Client API Key/session support for legacy compatibility.
+- Adds a read-only time-card package query and redacts echoed credentials from API errors.
+- Documents interactive and manual login verification, plus the need to recreate and rebind instances already destroyed by the hosting service.
 
-### v3 — fully automated startup
+### v4 (historical) — Client API Key panel authentication
 
-- Added headless Chromium sign-in with Playwright to renew expired JWTs transparently.
+- Preferred a Pterodactyl Client API Key created from the Minekuai account page.
+- Added Fernet-encrypted API Key storage in SQLite without printing or committing the keys.
+- Retained session cookies as a compatibility fallback when an API Key was not configured.
+- The time-card API at that time used a JWT from `api.minekuai.com`, with Playwright renewal when possible.
+
+### v3 (historical) — automatic instance startup
+
+- Added headless Chromium sign-in with Playwright to attempt renewal of expired JWTs.
 - Added Pterodactyl panel cookie management with automatic session renewal.
 - Added automatic instance start after the time card: `POST /api/client/servers/<id>/power {"signal":"start"}`.
 - Added `添加账号`, `账号列表`, `删除账号`, `绑定账号`, and `修改uuid`.

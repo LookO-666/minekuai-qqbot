@@ -1,12 +1,12 @@
 """
 麦块联机 API 客户端
 
-主要走 MinekuaiClient（api.minekuai.com，Bearer 认证）：
+主要走 MinekuaiClient（api.minekuai.cn，Bearer 认证）：
 - start_timing / stop_timing：开关计时卡（控制扣费）
-- verify_eula：触发实例启动（同一套 Bearer 认证，不需要 cookies）
+- get_user_packages：只读查询当前账号的计时卡套餐
 
-PanelClient（minekuai.com/api/client/...）优先使用长期 Client API Key；
-旧的 cookies + XSRF 认证保留为兼容回退。
+PanelClient 优先使用新版 api.minekuai.cn/panel/... 的 JWT + clientid；
+旧版 Client API Key、cookies + XSRF 认证保留为显式兼容回退。
 
 设计原则:
 - 所有 HTTP 调用都封装在这里，业务逻辑不直接碰 httpx
@@ -15,10 +15,18 @@ PanelClient（minekuai.com/api/client/...）优先使用长期 Client API Key；
 """
 
 import asyncio
+import json
+import re
 
 from typing import Any
+from urllib.parse import quote, quote_plus, unquote
 import httpx
 from loguru import logger
+
+try:
+    from .panel_power import send_power, PreSendAuthError, PowerTransportError
+except ImportError:
+    from panel_power import send_power, PreSendAuthError, PowerTransportError
 
 
 class MinekuaiError(Exception):
@@ -37,6 +45,29 @@ class RateLimitError(MinekuaiError):
     """请求被麦块联机后端限流。
     通常意味着同一个计时卡刚做过开/关操作，新请求被拒绝。
     实际状态大概率已经是请求想要的状态。"""
+
+
+_JWT_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\."
+    r"[A-Za-z0-9_-]*(?![A-Za-z0-9_-])"
+)
+
+
+def _safe_error_text(value: Any, *secrets: str) -> str:
+    """Keep useful API errors without forwarding credentials echoed by a backend."""
+    text = _JWT_PATTERN.sub("[REDACTED]", str(value))
+    variants = set()
+    for secret in secrets:
+        if secret:
+            decoded = unquote(secret)
+            variants.update((
+                secret, decoded, quote(secret, safe=""), quote_plus(secret),
+                json.dumps(secret)[1:-1], json.dumps(secret, ensure_ascii=False)[1:-1],
+            ))
+    for secret in sorted(variants, key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text
 
 
 def _timeout_message(error: httpx.TimeoutException, service: str) -> str:
@@ -67,7 +98,7 @@ def _json_response(response: httpx.Response, service: str, *, allow_empty: bool 
 class MinekuaiClient:
     """麦块联机计时卡 API 客户端（异步）"""
 
-    BASE_URL = "https://api.minekuai.com"
+    BASE_URL = "https://api.minekuai.cn"
     DEFAULT_TIMEOUT = 15.0
 
     def __init__(self, token: str, client_id: str):
@@ -121,30 +152,34 @@ class MinekuaiClient:
         try:
             r = await self._http.request(method, path, **kwargs)
         except httpx.TimeoutException as e:
-            raise APIError(_timeout_message(e, "计时卡 API（api.minekuai.com）")) from e
+            raise APIError(_timeout_message(e, "计时卡 API（api.minekuai.cn）")) from None
         except httpx.HTTPError as e:
-            raise APIError(f"网络错误: {e}") from e
+            raise APIError(f"网络错误: {_safe_error_text(e, self._token)}") from None
 
-        if r.status_code == 401:
+        if r.status_code in (401, 419):
             raise AuthError("token 已过期或无效，请更新配置中的 MINEKUAI_TOKEN")
 
         if r.status_code >= 400:
-            raise APIError(f"HTTP {r.status_code}: {r.text[:200]}")
+            detail = _safe_error_text(r.text, self._token)[:200]
+            raise APIError(f"HTTP {r.status_code}: {detail}")
 
         data = _json_response(r, "计时卡 API")
 
         if isinstance(data, dict) and "code" in data:
             code = data.get("code")
             if code not in (200, 0, "200", "0", None):
-                msg = data.get("msg") or data.get("message") or "未知错误"
+                msg = _safe_error_text(
+                    data.get("msg") or data.get("message") or "未知错误", self._token,
+                )
                 # 业务码 401 也认作认证失败（HTTP 200 + body code=401，
                 # 麦块联机 token 过期/冻结时是这个形式）
-                if code in (401, "401"):
-                    raise AuthError(f"token 已过期或被冻结，请更新 MINEKUAI_TOKEN: {msg}")
+                if code in (401, 419, "401", "419"):
+                    raise AuthError("token 已过期或被冻结，请更新 MINEKUAI_TOKEN")
                 # 500 + "操作太频繁" = 限流，通常意味着前一次操作刚完成
                 if code in (500, "500") and ("频繁" in msg or "稍后" in msg):
                     raise RateLimitError(msg)
-                raise APIError(f"接口业务失败 [{code}]: {msg}")
+                safe_code = _safe_error_text(code, self._token)
+                raise APIError(f"接口业务失败 [{safe_code}]: {msg}")
 
         logger.debug(f"← {r.status_code} {path}")
         return data
@@ -152,6 +187,10 @@ class MinekuaiClient:
     # ============================================================
     # 计时卡接口
     # ============================================================
+
+    async def get_user_packages(self) -> dict:
+        """只读查询当前账号的计时卡套餐，不改变计时卡状态。"""
+        return await self._request("GET", "/system/timeBalance/user/userPackages")
 
     async def start_timing(self, card_id: str) -> dict:
         """打开计时卡（开始计时扣费）"""
@@ -195,11 +234,12 @@ class MinekuaiClient:
 class PanelClient:
     """麦块联机 Pterodactyl 面板 API 客户端（异步）
 
-    通过标准 Pterodactyl Client API 控制服务器。优先使用长期 API Key；
-    未配置 API Key 时兼容 Laravel session cookies + X-XSRF-TOKEN。
+    新版网关与计时卡共用 JWT + clientid，并解包外层 code/data。
+    未提供 JWT 时兼容旧版 Client API Key / Laravel session。
     """
 
     BASE_URL = "https://minekuai.com"
+    GATEWAY_URL = "https://api.minekuai.cn"
     DEFAULT_TIMEOUT = 30.0   # 面板调用比计时卡慢，容差大一些
 
     def __init__(
@@ -207,9 +247,17 @@ class PanelClient:
         api_key: str = "",
         session_cookie: str = "",
         xsrf_token: str = "",
+        *,
+        token: str = "",
+        client_id: str = "",
     ):
-        if not api_key and not (session_cookie and xsrf_token):
-            raise ValueError("panel_api_key 或 session_cookie + xsrf_token 至少配置一组")
+        if bool(token) != bool(client_id):
+            raise ValueError("新版面板 token 和 client_id 必须同时配置")
+        if not token and not api_key and not (session_cookie and xsrf_token):
+            raise ValueError("请配置 token + client_id，或旧版面板 API 凭据")
+        self._token = token
+        self._client_id = client_id
+        self.BASE_URL = self.GATEWAY_URL if token else type(self).BASE_URL
         self._api_key = api_key
         self._cookie = session_cookie
         self._xsrf = xsrf_token
@@ -228,6 +276,16 @@ class PanelClient:
             await self._http.aclose()
             self._http = None
 
+    def _error_text(self, value: Any) -> str:
+        cookie_values = (
+            part.partition("=")[2].strip().strip('"')
+            for part in self._cookie.split(";")
+            if "=" in part
+        )
+        return _safe_error_text(
+            value, self._token, self._api_key, self._cookie, self._xsrf, *cookie_values,
+        )
+
     def _build_headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/json, text/plain, */*",
@@ -241,17 +299,30 @@ class PanelClient:
             ),
             "X-Requested-With": "XMLHttpRequest",
         }
-        if self._api_key:
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+            headers["clientid"] = self._client_id
+            headers["Content-Language"] = "zh_CN"
+        elif self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
         else:
             headers["Cookie"] = self._cookie
             headers["X-XSRF-TOKEN"] = self._xsrf
         return headers
 
+    def _server_path(self, instance_id: str, suffix: str = "") -> str:
+        prefix = "/panel" if self._token else "/api/client"
+        return f"{prefix}/servers/{instance_id}{suffix}"
+
+    def _auth_type(self) -> str:
+        return "JWT" if self._token else ("API Key" if self._api_key else "session/CSRF")
+
     async def _request(
         self,
         method: str,
         path: str,
+        *,
+        _allow_uncoded_gateway: bool = False,
         **kwargs: Any,
     ) -> dict:
         if self._http is None:
@@ -261,53 +332,74 @@ class PanelClient:
         try:
             r = await self._http.request(method, path, **kwargs)
         except httpx.TimeoutException as e:
-            raise APIError(_timeout_message(e, "面板 API（minekuai.com）")) from e
+            raise APIError(_timeout_message(e, f"面板 API（{self.BASE_URL}）")) from None
         except httpx.HTTPError as e:
-            raise APIError(f"面板网络错误: {e}") from e
+            raise APIError(f"面板网络错误: {self._error_text(e)}") from None
 
         if r.status_code in (401, 419):
-            auth_type = "API Key" if self._api_key else "session/CSRF"
+            auth_type = self._auth_type()
             raise AuthError(
                 f"面板 {auth_type} 认证失败 (HTTP {r.status_code})"
             )
 
         if r.status_code >= 400:
-            raise APIError(f"面板 HTTP {r.status_code}: {r.text[:200]}")
+            raise APIError(f"面板 HTTP {r.status_code}: {self._error_text(r.text)[:200]}")
 
         data = _json_response(r, "面板 API", allow_empty=True)
 
         if isinstance(data, dict) and "code" in data:
             code = data.get("code")
             if code not in (200, 0, "200", "0", None):
-                msg = data.get("msg") or data.get("message") or "未知错误"
+                msg = self._error_text(data.get("msg") or data.get("message") or "未知错误")
                 if code in (401, 419, "401", "419"):
-                    raise AuthError(f"面板业务码 {code}: {msg}")
+                    raise AuthError(f"面板认证失败（业务码 {code}），请更新认证信息")
                 if code in (500, "500") and ("频繁" in msg or "稍后" in msg):
                     raise RateLimitError(msg)
-                raise APIError(f"面板业务失败 [{code}]: {msg}")
+                raise APIError(f"面板业务失败 [{self._error_text(code)}]: {msg}")
+
+        if self._token:
+            if data.get("code") not in (200, "200", 0, "0") and not (
+                _allow_uncoded_gateway and "code" not in data and "data" in data
+            ):
+                raise APIError("新版面板响应缺少成功业务码；未确认操作成功")
+            payload = data.get("data")
+            if payload is None:
+                data = {}
+            elif isinstance(payload, dict):
+                data = payload
+            else:
+                raise APIError("新版面板响应数据格式异常；未确认操作成功")
 
         logger.debug(f"← [panel] {r.status_code} {path}")
         return data
 
     # ------------------------------------------------------------
-    # 启动/停止/重启实例 - Pterodactyl 标准 power endpoint
+    # 新版使用官网 WebSocket 电源协议，旧版保留 HTTP power endpoint
     # ------------------------------------------------------------
 
     async def power(self, instance_id: str, signal: str) -> dict:
         """发送电源信号给实例。signal: start / stop / restart / kill。
 
-        实测响应是 HTTP 204 No Content（成功），失败返回 4xx + JSON 错误。
-        instance_id 短 ID（如 420d4426）和完整 UUID 都接受。
+        新版：认证后发送一次 set state，等待兼容状态变化，超时不重发。
+        旧版：HTTP 204 No Content。短 ID 和完整 UUID 都接受。
         """
+        if self._token:
+            credentials = await self.get_ws_credentials(instance_id)
+            try:
+                return await send_power(credentials["socket"], credentials["token"], signal)
+            except PreSendAuthError as error:
+                raise AuthError(str(error)) from None
+            except PowerTransportError as error:
+                raise APIError(str(error)) from None
         return await self._request(
             "POST",
-            f"/api/client/servers/{instance_id}/power",
+            self._server_path(instance_id, "/power"),
             json={"signal": signal},
         )
 
     async def start_instance(self, instance_id: str) -> None:
         """启动服务器实例。"""
-        logger.info(f"[panel] POST power signal=start for {instance_id}")
+        logger.info(f"[panel] power signal=start for {instance_id}")
         try:
             await self.power(instance_id, "start")
         except (AuthError, RateLimitError):
@@ -330,7 +422,7 @@ class PanelClient:
         cmd = command.lstrip("/").strip()
         logger.info(f"[panel] POST command to {instance_id}: {cmd[:60]}")
         await self._request(
-            "POST", f"/api/client/servers/{instance_id}/command",
+            "POST", self._server_path(instance_id, "/command"),
             json={"command": cmd},
         )
 
@@ -341,7 +433,7 @@ class PanelClient:
     async def get_server_info(self, instance_id: str) -> dict:
         """实例基本信息：名字、端口分配、CPU/内存/磁盘配额等。"""
         return await self._request(
-            "GET", f"/api/client/servers/{instance_id}"
+            "GET", self._server_path(instance_id)
         )
 
     async def get_resources(self, instance_id: str) -> dict:
@@ -350,7 +442,7 @@ class PanelClient:
         attributes.current_state ∈ {running, offline, starting, stopping}
         """
         return await self._request(
-            "GET", f"/api/client/servers/{instance_id}/resources"
+            "GET", self._server_path(instance_id, "/resources")
         )
 
     async def list_directory(
@@ -360,7 +452,7 @@ class PanelClient:
         目录不存在时面板返回 404 → APIError。
         """
         data = await self._request(
-            "GET", f"/api/client/servers/{instance_id}/files/list",
+            "GET", self._server_path(instance_id, "/files/list"),
             params={"directory": directory},
         )
         return [item.get("attributes", {}) for item in data.get("data", [])]
@@ -370,8 +462,13 @@ class PanelClient:
         返回 {"socket": "wss://...", "token": "JWT"}。
         """
         d = await self._request(
-            "GET", f"/api/client/servers/{instance_id}/websocket"
+            "GET", self._server_path(instance_id, "/websocket"),
+            _allow_uncoded_gateway=True,
         )
+        if self._token:
+            if not isinstance(d.get("token"), str) or not isinstance(d.get("socket"), str):
+                raise APIError("新版面板 WebSocket 凭据格式异常")
+            return d
         return d.get("data", {}) if isinstance(d, dict) else {}
 
     async def read_file_text(self, instance_id: str, file_path: str) -> str:
@@ -383,18 +480,27 @@ class PanelClient:
         logger.debug(f"→ [panel] GET file {file_path} ({instance_id})")
         try:
             r = await self._http.get(
-                f"/api/client/servers/{instance_id}/files/contents",
+                self._server_path(instance_id, "/files/contents"),
                 params={"file": file_path},
             )
         except httpx.TimeoutException as e:
-            raise APIError(f"读取文件超时: {file_path}") from e
+            raise APIError(f"读取文件超时: {self._error_text(file_path)}") from None
         except httpx.HTTPError as e:
-            raise APIError(f"网络错误: {e}") from e
+            raise APIError(f"网络错误: {self._error_text(e)}") from None
         if r.status_code in (401, 419):
-            auth_type = "API Key" if self._api_key else "session/CSRF"
+            auth_type = self._auth_type()
             raise AuthError(
                 f"面板 {auth_type} 认证失败 (HTTP {r.status_code})"
             )
         if r.status_code >= 400:
-            raise APIError(f"面板 HTTP {r.status_code}: {r.text[:200]}")
+            raise APIError(f"面板 HTTP {r.status_code}: {self._error_text(r.text)[:200]}")
+        if self._token:
+            # The gateway can report authentication errors with HTTP 200 even
+            # though a successful file response is raw text, not a JSON envelope.
+            try:
+                failure = r.json()
+            except ValueError:
+                failure = None
+            if isinstance(failure, dict) and failure.get("code") in (401, "401", 419, "419"):
+                raise AuthError("面板 JWT 认证失败，请更新认证信息")
         return r.text
