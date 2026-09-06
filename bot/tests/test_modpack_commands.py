@@ -1,6 +1,7 @@
 """Offline QQ command tests; real confirmation state, fake UI and service I/O."""
 from dataclasses import replace
 import ast
+import runpy
 import asyncio
 import importlib.util
 from pathlib import Path
@@ -483,15 +484,10 @@ async def test_failed_confirmation_warns_about_billing_and_qq_recovery(ui):
     assert "我已核对" not in message and "官网" not in message
 
 
-def test_modpack_help_discloses_billing_and_platform_autostart():
-    tree = ast.parse((PLUGIN / "__init__.py").read_text(encoding="utf-8"))
-    assignment = next(
-        node for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "MODPACK_HELP" for target in node.targets)
-    )
-    text = ast.literal_eval(assignment.value)
-    for phrase in ("开卡计费", "消耗时长", "平台若自动启动则正常停服", "不强杀", "不会自动关卡", "计费可能继续"):
+def test_modpack_detail_help_discloses_billing_and_destructive_install():
+    render_help = runpy.run_path(str(PLUGIN / "help_content.py"))["render_help"]
+    text = render_help("整合包")
+    for phrase in ("覆盖", "备份", "计费", "消耗时长", "不会自动启动游戏或关闭计时卡"):
         assert phrase in text
 
 

@@ -1,5 +1,6 @@
 """Manual control reconciliation must not weaken guards, locks, or permissions."""
 import ast
+import runpy
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -335,10 +336,8 @@ def test_reconciliation_is_not_added_to_background_or_generic_control_wrappers()
 
 
 def test_modpack_help_supports_entirely_in_group_status_and_logs():
-    tree = ast.parse((PLUGIN / "__init__.py").read_text(encoding="utf-8"))
-    value = next(node.value for node in tree.body if isinstance(node, ast.Assign)
-                 and any(isinstance(target, ast.Name) and target.id == "MODPACK_HELP" for target in node.targets))
-    help_text = ast.literal_eval(value)
+    render_help = runpy.run_path(str(PLUGIN / "help_content.py"))["render_help"]
+    help_text = render_help("整合包")
     assert "整合包日志" in help_text and "自动解除" in help_text
     assert "我已核对" not in help_text and "官网核对" not in help_text
 

@@ -35,6 +35,17 @@ Commands have no prefix by default and can be sent directly in a QQ group. Comma
 
 The command names are Chinese because the bot is designed for Chinese QQ groups; English aliases are available for several common operations.
 
+### In-group help by scenario
+
+Send `帮助` or `help` for a short, copyable text home page with everyday commands. Request just the scenario you need:
+
+- `帮助 服务器` — start/stop, connection addresses, and server queries.
+- `帮助 玩家` — chat bridging, player linking, profiles, and statistics.
+- `帮助 整合包` — change a pack, check installation status/logs, and get its client download link.
+- `帮助 管理` — account/server setup, console operations, and automatic shutdown settings.
+
+For example, send `帮助 整合包`, then `更换整合包 test` and follow the prompts. Detailed billing, data-loss, verification, and confirmation notices appear at the relevant operation steps; the full command reference remains below. This is navigation only: command permissions and safety checks are unchanged. Help messages are not relayed into Minecraft chat.
+
 ### Everyday controls and queries
 
 | Command | Description |
@@ -108,8 +119,8 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 |---|---|
 | `取消` | Cancel the current multi-step interaction. |
 | `图形验证码 <answer>` | Answer the image arithmetic challenge when a Minekuai risk-control login asks for it. Only the user who started the login can answer. |
-| `短信验证码 <6 digits>` / `验证码 <6 digits>` | Continue the same login after the SMS code arrives. A private message to the bot is recommended. |
-| `帮助` / `help` | Show the built-in help message. |
+| `短信验证码 <6 digits>` / `验证码 <6 digits>` | Continue the login in the original conversation after the SMS code arrives. Start sensitive account setup in an authorized private chat when possible. |
+| `帮助` / `help`; `帮助 服务器` / `帮助 玩家` / `帮助 整合包` / `帮助 管理` | Show the short home page or one scenario's help. |
 
 > The chat bridge processes ordinary plain text in allowed groups. Recognized bot commands are intercepted by command handlers and are never relayed as chat. With multiple servers, one QQ message is sent to every server where online players have been detected.
 

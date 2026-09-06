@@ -95,6 +95,7 @@ def handlers():
         "ArgPlainText": lambda name: None,
         "CANCEL_WORDS": {"取消", "cancel"},
         "_check_perm": lambda event: (True, ""),
+        "parse_help_topic": importlib.import_module("help_content").parse_help_topic,
         "_check_admin_perm": lambda event: (True, ""),
         "_user_display_name": lambda event: "tester",
         "_mask_phone": lambda phone: "***",

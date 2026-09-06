@@ -58,10 +58,9 @@ token 失效时：如果服务器绑了账号，bot 会用 Playwright 自动登�
 import asyncio
 import base64
 import re
-from pathlib import Path
 
 from nonebot import (
-    get_driver, get_plugin_config, on_command, on_fullmatch, on_message,
+    get_driver, get_plugin_config, on_command, on_fullmatch, on_message, on_regex,
 )
 from nonebot.adapters.onebot.v11 import (
     Bot,
@@ -86,6 +85,7 @@ from .client import (
     RateLimitError,
 )
 from .config import Config
+from .help_content import HELP_PATTERN, parse_help_topic, render_help
 from .modpack_state import ConfirmError, MaintenanceError, MaintenanceStore, ServerIdentity
 from .operations import (
     OperationBusyError, card_operation, ensure_card_available, set_maintenance_guard,
@@ -3479,6 +3479,10 @@ async def _chat_relay(bot: Bot, event: MessageEvent):
     text = event.get_plaintext().strip()
     if not text:
         return
+    # Help is navigation, never game chat. Keep this explicit in addition to
+    # the help matcher's block=True so unknown topics cannot leak to tellraw.
+    if parse_help_topic(text) is not None:
+        return
     # 收敛长度 + 去掉换行(tellraw 单行)
     text = text.replace("\n", " ")
     if len(text) > 200:
@@ -3650,119 +3654,27 @@ async def _restart(
 # 指令: 帮助
 # ============================================================
 
-help_cmd = on_fullmatch(
-    ("帮助", "help", "Help", "HELP"),
-    priority=10, block=True,
-)
-
-
-HELP_IMG_PATH = Path(__file__).parent / "assets" / "help.png"
-MODPACK_HELP = (
-    "━━ 📦 整合包更换（管理员） ━━\n"
-    "更换整合包 [服务器] [关键词]｜搜索整合包、选择版本\n"
-    "⚠️ 安装会覆盖全部文件和世界，请先自行备份！\n"
-    "确认清空安装 <确认码>｜原人原会话 5 分钟内，授权开卡计费＋清空安装\n"
-    "先开计时卡（消耗时长），平台若自动启动则正常停服后安装，不强杀\n"
-    "开卡或就绪失败不安装，保护保留；不会自动关卡，计费可能继续\n"
-    "取消更换整合包｜撤销未提交的确认\n"
-    "整合包状态 [服务器]｜群内自动核对安装结果，已结束时自动解除维护保护\n"
-    "整合包日志 [服务器]｜群内查看安装日志，无需离开 QQ\n"
-    "整合包客户端 [服务器] / 客户端 / 下载客户端｜查询客户端链接（普通成员可用）\n"
-    "安装请求发出后会在原会话发送所选版本下载信息；可能仅有免费目录，非版本直链\n"
-    "只发链接，不上传文件、不调用扣积分直链接口；没有链接不影响安装\n"
-    "结束整合包维护 <服务器>｜让机器人核对并解除已结束安装的保护\n"
-    "开服 / 关服 / 重启会先核对遗留维护；安装中或结果未知仍会阻止操作\n"
-)
+help_cmd = on_regex(HELP_PATTERN, priority=10, block=True)
 
 
 @help_cmd.handle()
 async def _help(matcher: Matcher, event: MessageEvent):
-    group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
-    if config.allowed_groups and group_id not in config.allowed_groups:
+    ok, reason = _check_perm(event)
+    if not ok:
+        if reason:
+            await matcher.finish(MessageSegment.text(reason))
         return
-
-    # 优先发图片
-    try:
-        if HELP_IMG_PATH.is_file():
-            await matcher.finish(
-                MessageSegment.image(HELP_IMG_PATH.read_bytes())
-                + MessageSegment.text("\n" + MODPACK_HELP + "\n项目地址：\nhttps://github.com/LookO-666/minekuai-qqbot")
-            )
-    except MatcherException:
-        raise
-    except Exception:
-        logger.exception("帮助图发送失败,回退到文本版")
-
-    # fallback: 文本版（图不存在 / 发图失败 / 协议端有问题时用）
-    confirm_line = (
-        "确认关服｜5 分钟内确认刚才的关服请求\n"
-        if config.stop_need_confirm else ""
-    )
-    admin_scope = (
-        "白名单群内所有成员可用"
-        if config.admin_all_group_members else "仅管理员可用"
-    )
-    text = (
-        "🎮 麦块联机 QQ Bot｜帮助\n"
-        "直接发送指令，不用 @，默认无前缀。\n"
-        "[服务器] 可不填；<内容> 必须填写。\n"
-        f"🔒 {admin_scope}。\n"
-        "多台服务器且未写名字时，Bot 会提示选择。\n"
-        "\n"
-        "━━ 🚀 开关服与查询 ━━\n"
-        "开服 [服务器]｜开启计时卡并启动实例\n"
-        "关服 [服务器]｜关闭服务器，默认需要确认\n"
-        f"{confirm_line}"
-        "在线 [服务器]｜查询人数、玩家、延迟和版本\n"
-        "查服 [服务器]｜查询实例、CPU、内存和磁盘\n"
-        "服务器列表｜查看全部服务器\n"
-        "服务器地址 [服务器]｜查看连接地址\n"
-        "模组 / 插件 [服务器]｜查看已安装的 JAR\n"
-        "mc <正版玩家名>｜生成 Minecraft 玩家资料卡\n"
-        "\n"
-        "━━ 💬 群服互通与玩家 ━━\n"
-        "群内普通文字 → 转发到当前有玩家的服务器\n"
-        "游戏聊天、加入/离开、死亡、成就 → 自动发群\n"
-        "绑定 <游戏名>｜绑定自己的 QQ 与游戏名\n"
-        "解绑｜解除自己的绑定\n"
-        "绑定列表｜查看全部玩家绑定\n"
-        "今日榜 / 本周榜｜查看在线时长排行\n"
-        "在线时长 [游戏名]｜查看个人在线时长\n"
-        "死亡榜 / 死亡次数 [游戏名]｜查看死亡统计\n"
-        "🔒 绑定 <QQ> <游戏名> / 解绑 <QQ>｜代操作\n"
-        "\n"
-        "━━ 🛠️ 管理员运维 ━━\n"
-        "🔒 指令 [服务器] <MC命令>｜发送控制台命令\n"
-        "🔒 日志 [服务器] [行数]｜读取最近日志，最多 200 行\n"
-        "🔒 重启 [服务器]｜重启实例，不关闭计时卡\n"
-        "🔒 自动关停｜查看全部设置和当前倒计时\n"
-        "🔒 自动关停 <服务器> <分钟>｜0 表示关闭\n"
-        "🔒 暂停自动关停 [分钟]｜全局临时暂停\n"
-        "🔒 取消关停 / 保留｜阻止本次自动关停\n"
-        "\n"
-        f"{MODPACK_HELP}\n"
-        "━━ ⚙️ 管理员配置 ━━\n"
-        "🔒 添加账号 / 账号列表 / 删除账号 <手机号>\n"
-        "🔒 添加服务器｜按提示完成 5 步配置\n"
-        "🔒 删除服务器 <服务器>｜删除前需要确认\n"
-        "🔒 修改服务器名字 [旧名] [新名]\n"
-        "🔒 修改地址 [服务器] [新地址]\n"
-        "🔒 修改uuid [服务器] [实例ID]\n"
-        "🔒 绑定账号 <服务器> <手机号>\n"
-        "🔒 更新token <服务器>｜仅自动续期失败时使用\n"
-        "\n"
-        "━━ 📌 其他 ━━\n"
-        "取消｜退出当前多步操作\n"
-        "图形验证码 <答案>｜登录风控时提交图片计算结果\n"
-        "短信验证码 <6位> / 验证码 <6位>｜继续风险登录\n"
-        "帮助 / help｜再次显示本帮助\n"
-        "\n"
-        f"指令冷却：{config.command_cooldown} 秒\n"
-        "项目地址：\n"
-        "LookO-666/minekuai-qqbot\n"
-        "https://github.com/LookO-666/minekuai-qqbot"
-    )
-    await matcher.finish(text)
+    topic = parse_help_topic(event.get_plaintext())
+    if topic is None:
+        return
+    # One text source for every help page: copyable commands, no stale image
+    # followed by a second full manual. Help never reads remote server state.
+    await matcher.finish(MessageSegment.text(render_help(
+        topic,
+        admin_all_group_members=config.admin_all_group_members,
+        stop_need_confirm=config.stop_need_confirm,
+        command_cooldown=config.command_cooldown,
+    )))
 
 
 # Destructive installations never use the generic write/auth-retry wrappers.
