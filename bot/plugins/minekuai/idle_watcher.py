@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover
     websockets = None
 
 from . import servers
+from .operations import OperationBusyError, ensure_card_available
 
 if TYPE_CHECKING:
     from nonebot.adapters.onebot.v11 import Bot
@@ -486,6 +487,16 @@ def _shares_timing_card(s: servers.Server) -> bool:
     )
 
 
+def _automatic_control_available(s: servers.Server) -> bool:
+    """Suppress automatic-action notices while persistent protection is active."""
+    try:
+        ensure_card_available(s.card_id)
+    except OperationBusyError as exc:
+        logger.debug(f"[idle] {s.name} 暂停自动控制: {exc}")
+        return False
+    return True
+
+
 async def _check_keepalive(s: servers.Server) -> None:
     """6 天未启动的服务器自动短暂启动一次，避免服务商回收。"""
     if _start_callback is None or _close_callback is None:
@@ -494,6 +505,8 @@ async def _check_keepalive(s: servers.Server) -> None:
         s.card_id and s.instance_uuid
         and (s.account_phone or (s.token and s.client_id))
     ):
+        return
+    if not _automatic_control_available(s):
         return
 
     task = _keepalive_tasks.get(s.name)
@@ -523,6 +536,8 @@ async def _check_keepalive(s: servers.Server) -> None:
         )
         running = None
     if time() < _keepalive_retry_after.get(s.name, 0):
+        return
+    if not _automatic_control_available(s):
         return
     if running is None:
         _keepalive_retry_after[s.name] = now + KEEPALIVE_RETRY_SECONDS
@@ -574,6 +589,8 @@ async def _keepalive_cycle(server_name: str, age_days: int) -> None:
         fresh = servers.get_server(server_name)
         if fresh is None:
             return
+        if not _automatic_control_available(fresh):
+            return
 
         minutes = max(1, KEEPALIVE_RUNTIME_SECONDS // 60)
         await _broadcast(
@@ -581,6 +598,8 @@ async def _keepalive_cycle(server_name: str, age_days: int) -> None:
             f"现在自动保活开机，约 {minutes} 分钟后会自动关机。"
         )
 
+        if not _automatic_control_available(fresh):
+            return
         ok, msg = await _start_callback(fresh)  # type: ignore[misc]
         if not ok:
             _keepalive_retry_after[server_name] = time() + KEEPALIVE_RETRY_SECONDS
@@ -597,6 +616,8 @@ async def _keepalive_cycle(server_name: str, age_days: int) -> None:
         fresh = servers.get_server(server_name)
         if fresh is None:
             await _broadcast(f"⚠️ 『{server_name}』已不存在，跳过保活关机")
+            return
+        if not _automatic_control_available(fresh):
             return
         ok, msg = await _close_callback(fresh)
         if ok:
@@ -619,6 +640,8 @@ async def _keepalive_cycle(server_name: str, age_days: int) -> None:
 
 async def _check_idle(s: servers.Server, status: "SlpStatus | None") -> None:
     """空闲检查;复用调用方已查好的 status,避免重复 SLP。"""
+    if not _automatic_control_available(s):
+        return
     if _shares_timing_card(s):
         return
     now = time()
@@ -1116,6 +1139,10 @@ async def _eval_breach(
 
 async def _countdown_close(server: servers.Server) -> None:
     """广播倒计时 → 等 COUNTDOWN_SECONDS → 真关"""
+    if not _automatic_control_available(server):
+        if _pending_close.get(server.name) is asyncio.current_task():
+            _pending_close.pop(server.name, None)
+        return
     msg = (
         f"⚠️ 『{server.name}』已空闲 {server.auto_close_idle_minutes} 分钟，"
         f"将在 {COUNTDOWN_SECONDS} 秒后自动关停。\n"
@@ -1143,6 +1170,8 @@ async def _countdown_close(server: servers.Server) -> None:
         fresh = servers.get_server(server.name)
         if fresh is None:
             await _broadcast(f"⚠️ 『{server.name}』已不存在，跳过关停")
+            return
+        if not _automatic_control_available(fresh):
             return
         ok, msg = await _close_callback(fresh)
         if ok:

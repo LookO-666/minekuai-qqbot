@@ -31,6 +31,14 @@ def idle_watcher_mod(monkeypatch):
         / "minekuai"
         / "idle_watcher.py"
     )
+    operations_name = f"{package_name}.operations"
+    operations_spec = importlib.util.spec_from_file_location(
+        operations_name, path.with_name("operations.py"),
+    )
+    operations = importlib.util.module_from_spec(operations_spec)
+    monkeypatch.setitem(sys.modules, operations_name, operations)
+    assert operations_spec.loader is not None
+    operations_spec.loader.exec_module(operations)
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
@@ -318,3 +326,90 @@ async def test_manual_takeover_during_status_probe_prevents_keepalive(
     await check
     module._start_callback.assert_not_awaited()
     assert module._keepalive_tasks == {}
+
+
+def _protect_automatic_controls(module, reason="实例维护保护中"):
+    operations = sys.modules[f"{module.__package__}.operations"]
+
+    def guard(_card_id):
+        # Includes database/read errors: operations converts all failures to busy.
+        raise RuntimeError(reason)
+
+    operations.set_maintenance_guard(guard)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", [
+    "_check_keepalive", "_check_idle", "_keepalive_cycle", "_countdown_close",
+])
+@pytest.mark.parametrize("reason", ["实例维护保护中", "无法读取维护数据库"])
+async def test_maintenance_silently_skips_automatic_tasks_and_notices(
+    idle_watcher_mod, monkeypatch, caller, reason,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    server.auto_close_idle_minutes = 1
+    _configure_keepalive(module, monkeypatch, server)
+    monkeypatch.setattr(module, "time", lambda: 4_000_000.0)
+    module._open_at[server.name] = 1_000_000.0
+    module._last_active[server.name] = 1_000_000.0
+    _protect_automatic_controls(module, reason)
+
+    if caller == "_check_idle":
+        await module._check_idle(server, types.SimpleNamespace(online=0))
+    elif caller == "_keepalive_cycle":
+        await module._keepalive_cycle(server.name, 10)
+    else:
+        await getattr(module, caller)(server)
+    module._broadcast.assert_not_awaited()
+    module._looks_running.assert_not_awaited()
+    module._start_callback.assert_not_awaited()
+    module._close_callback.assert_not_awaited()
+    assert module._keepalive_tasks == {}
+    assert module._pending_close == {}
+
+
+@pytest.mark.asyncio
+async def test_maintenance_started_during_probe_prevents_keepalive_notices(
+    idle_watcher_mod, monkeypatch,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    _configure_keepalive(module, monkeypatch, server)
+    monkeypatch.setattr(module, "time", lambda: 4_000_000.0)
+
+    async def probe(_server):
+        _protect_automatic_controls(module)
+        return False
+
+    monkeypatch.setattr(module, "_looks_running", probe)
+    await module._check_keepalive(server)
+    module._broadcast.assert_not_awaited()
+    module._start_callback.assert_not_awaited()
+    assert module._keepalive_tasks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["_countdown_close", "_keepalive_cycle"])
+async def test_maintenance_started_during_wait_prevents_close_and_failure_notice(
+    idle_watcher_mod, monkeypatch, caller,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    server.auto_close_idle_minutes = 1
+    _configure_keepalive(module, monkeypatch, server)
+    module._start_callback.return_value = (True, "ok")
+
+    async def sleep(_seconds):
+        _protect_automatic_controls(module)
+
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    if caller == "_countdown_close":
+        module._pending_close[server.name] = asyncio.current_task()
+        await module._countdown_close(server)
+        assert module._broadcast.await_count == 1
+    else:
+        await module._keepalive_cycle(server.name, 10)
+        assert module._broadcast.await_count == 2
+    module._close_callback.assert_not_awaited()
+    assert module._pending_close == {}

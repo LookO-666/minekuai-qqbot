@@ -86,7 +86,11 @@ from .client import (
     RateLimitError,
 )
 from .config import Config
-from .operations import OperationBusyError, card_operation
+from .modpack_state import MaintenanceError, MaintenanceStore
+from .operations import (
+    OperationBusyError, card_operation, ensure_card_available, set_maintenance_guard,
+    set_related_lock_keys,
+)
 from .permission import (
     check_cooldown,
     consume_pending_confirm,
@@ -107,6 +111,35 @@ __plugin_meta__ = PluginMetadata(
 config = get_plugin_config(Config)
 init_audit_db()
 servers.init_db()
+modpack_maintenance = MaintenanceStore(servers.DB_PATH)
+modpack_maintenance.init_db()
+
+
+def _configured_card_maintenance_guard(card_id: str) -> None:
+    """Also protect aliases of an instance configured against a different card."""
+    modpack_maintenance.ensure_card_available(card_id)
+    for server in servers.list_servers():
+        if server.card_id == card_id and server.instance_uuid:
+            modpack_maintenance.ensure_instance_available(server.instance_uuid)
+
+
+def _configured_instance_lock_keys(card_id: str):
+    """Short and full IDs of an instance share a lock even across card aliases."""
+    for server in servers.list_servers():
+        if server.card_id != card_id or not server.instance_uuid:
+            continue
+        instance = server.instance_uuid.casefold()
+        if re.fullmatch(
+            r"(?:[0-9a-f]{8}|[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})",
+            instance,
+        ):
+            yield "instance:" + instance[:8]
+        else:
+            yield "instance:exact:" + instance
+
+
+set_maintenance_guard(_configured_card_maintenance_guard)
+set_related_lock_keys(_configured_instance_lock_keys)
 # 兼容：从 .env 旧字段自动迁移单台配置（仅在数据库为空时生效）
 servers.maybe_migrate_from_env(
     config.minekuai_token,
@@ -118,6 +151,35 @@ servers.maybe_migrate_from_env(
 CANCEL_WORDS = {"取消", "cancel", "Cancel", "CANCEL"}
 VERIFICATION_TIMEOUT_SECONDS = 5 * 60
 _verification_broker = verification.VerificationBroker()
+
+
+async def _ensure_server_config_mutable(matcher: Matcher, name: str) -> None:
+    """Keep an active maintenance record attached to its existing server config."""
+    server = servers.get_server(name)
+    if server is None:
+        return
+    try:
+        ensure_card_available(server.card_id)
+    except OperationBusyError as exc:
+        await matcher.finish(f"❌ {exc}")
+
+
+async def _ensure_instance_config_mutable(matcher: Matcher, instance_uuid: str) -> None:
+    """Do not attach a new or edited config to an instance under maintenance."""
+    try:
+        modpack_maintenance.ensure_instance_available(instance_uuid)
+    except MaintenanceError as exc:
+        await matcher.finish(f"❌ {exc}")
+
+
+async def _ensure_new_server_config_mutable(
+    matcher: Matcher, card_id: str, instance_uuid: str,
+) -> None:
+    try:
+        ensure_card_available(card_id)
+    except OperationBusyError as exc:
+        await matcher.finish(f"❌ {exc}")
+    await _ensure_instance_config_mutable(matcher, instance_uuid)
 
 
 # ============================================================
@@ -1275,6 +1337,7 @@ async def _addr_update_finish(
     if not addr:
         await matcher.reject("地址不能为空。请重输（或『取消』）")
 
+    await _ensure_server_config_mutable(matcher, name)
     if not servers.update_address(name, addr):
         await matcher.finish(f"❌ 更新失败：服务器『{name}』不存在")
 
@@ -1475,6 +1538,8 @@ async def _add_finish(
     user_name = _user_display_name(event)
     group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
 
+    await _ensure_new_server_config_mutable(matcher, card_id, instance_uuid)
+
     # 自动登录拿 token / clientid / cookies
     await matcher.send(
         f"⏳ 正在用账号 {_mask_phone(account_phone)} 自动登录获取 token..."
@@ -1503,6 +1568,9 @@ async def _add_finish(
             f"❌ 自动登录异常：{type(e).__name__}: {e}\n"
             f"请重试或排查日志"
         )
+
+    # Login can yield while maintenance is started by another command.
+    await _ensure_new_server_config_mutable(matcher, card_id, instance_uuid)
 
     # 写入 DB
     try:
@@ -1630,6 +1698,8 @@ async def _uuid_update_finish(
             "请重输（或『清空』/『取消』）"
         )
 
+    await _ensure_server_config_mutable(matcher, name)
+    await _ensure_instance_config_mutable(matcher, val)
     if not servers.update_instance_uuid(name, val):
         await matcher.finish(f"❌ 更新失败：服务器『{name}』不存在")
 
@@ -1704,6 +1774,7 @@ async def _del_finish(
     if confirm.strip() != "确认":
         await matcher.finish("已取消")
 
+    await _ensure_server_config_mutable(matcher, name)
     if not servers.remove_server(name):
         await matcher.finish(f"❌ 删除失败：『{name}』不存在")
 
@@ -1901,6 +1972,7 @@ async def _rename_finish(
             f"名字『{new}』已被占用。请换一个（或『取消』）"
         )
 
+    await _ensure_server_config_mutable(matcher, old_name)
     if not servers.rename_server(old_name, new):
         await matcher.finish(f"❌ 改名失败：服务器『{old_name}』不存在")
 
@@ -2100,6 +2172,9 @@ async def _del_account_finish(
     if confirm.strip() != "确认":
         await matcher.finish("已取消")
 
+    for server in servers.list_servers():
+        if server.account_phone == phone:
+            await _ensure_server_config_mutable(matcher, server.name)
     if not servers.remove_account(phone):
         await matcher.finish(f"❌ 删除失败：『{_mask_phone(phone)}』不存在")
 
@@ -2156,6 +2231,7 @@ async def _bind_account(
             f"先发『添加账号』把它加进来。"
         )
 
+    await _ensure_server_config_mutable(matcher, server_name)
     if not servers.bind_server_account(server_name, phone):
         await matcher.finish("❌ 绑定失败")
 
@@ -2373,8 +2449,9 @@ async def _mc_cmd(
             await matcher.finish("❌ 面板 API 凭据丢失")
 
         try:
-            async with _build_panel_client(server, account) as panel:
-                await panel.send_command(server.instance_uuid, command)
+            async with card_operation(server.card_id):
+                async with _build_panel_client(server, account) as panel:
+                    await panel.send_command(server.instance_uuid, command)
             log_operation(
                 user_id, user_name, group_id,
                 f"mc_cmd {server.name}: {command[:100]}", True,
@@ -2382,6 +2459,9 @@ async def _mc_cmd(
             await matcher.finish(
                 f"✅ 已发送到『{server.name}』:\n{command}"
             )
+
+        except OperationBusyError as e:
+            await matcher.finish(f"❌ {e}")
 
         except AuthError as e:
             if not _server_has_panel_token(server) and account and account.panel_api_key:
@@ -2588,6 +2668,7 @@ async def _auto_close(
     if mins > 24 * 60:
         await matcher.finish("分钟数太大（不超过 24 小时）")
 
+    await _ensure_server_config_mutable(matcher, name)
     if not servers.update_auto_close(name, mins):
         await matcher.finish(f"❌ 更新失败")
 
@@ -2774,7 +2855,7 @@ async def _with_panel_refresh(
                 return None, f"刷新失败: {msg}", server
             server = servers.get_server(server.name) or server
             continue
-        except MinekuaiError as e:
+        except (MinekuaiError, OperationBusyError) as e:
             return None, str(e), server
         except Exception as e:
             logger.exception("[panel] 查询时发生未预期异常")
@@ -3350,7 +3431,12 @@ async def _chat_relay(bot: Bot, event: MessageEvent):
         async def _send(panel, _uuid=s.instance_uuid, _p=payload):
             await panel.send_command(_uuid, f"tellraw @a {_p}")
 
-        await _panel_run_bg(s, _send)
+        try:
+            async with card_operation(s.card_id):
+                await _panel_run_bg(s, _send)
+        except OperationBusyError:
+            # Maintenance and active power/install workflows must not receive chat commands.
+            continue
 
 
 # ============================================================
@@ -3457,7 +3543,8 @@ async def _restart(
         )
 
     async def _do(panel: PanelClient):
-        await panel.power(server.instance_uuid, "restart")
+        async with card_operation(server.card_id):
+            await panel.power(server.instance_uuid, "restart")
         return True
 
     result, msg, server = await _with_panel_refresh(
@@ -3496,6 +3583,15 @@ help_cmd = on_fullmatch(
 
 
 HELP_IMG_PATH = Path(__file__).parent / "assets" / "help.png"
+MODPACK_HELP = (
+    "━━ 📦 整合包更换（管理员） ━━\n"
+    "更换整合包 [服务器] [关键词]｜搜索整合包、选择版本\n"
+    "⚠️ 安装会覆盖全部文件和世界，请先自行备份！\n"
+    "确认清空安装 <确认码>｜原人原会话 5 分钟内确认\n"
+    "取消更换整合包｜撤销未提交的确认\n"
+    "整合包状态 [服务器]｜查看提交状态与维护保护\n"
+    "结束整合包维护 <服务器> 我已核对｜官网核对安装结束后解除保护\n"
+)
 
 
 @help_cmd.handle()
@@ -3509,6 +3605,7 @@ async def _help(matcher: Matcher, event: MessageEvent):
         if HELP_IMG_PATH.is_file():
             await matcher.finish(
                 MessageSegment.image(HELP_IMG_PATH.read_bytes())
+                + MessageSegment.text("\n" + MODPACK_HELP + "\n项目地址：\nhttps://github.com/LookO-666/minekuai-qqbot")
             )
     except MatcherException:
         raise
@@ -3562,6 +3659,7 @@ async def _help(matcher: Matcher, event: MessageEvent):
         "🔒 暂停自动关停 [分钟]｜全局临时暂停\n"
         "🔒 取消关停 / 保留｜阻止本次自动关停\n"
         "\n"
+        f"{MODPACK_HELP}\n"
         "━━ ⚙️ 管理员配置 ━━\n"
         "🔒 添加账号 / 账号列表 / 删除账号 <手机号>\n"
         "🔒 添加服务器｜按提示完成 5 步配置\n"
@@ -3584,3 +3682,34 @@ async def _help(matcher: Matcher, event: MessageEvent):
         "https://github.com/LookO-666/minekuai-qqbot"
     )
     await matcher.finish(text)
+
+
+# Destructive installations never use the generic write/auth-retry wrappers.
+from .modpack_commands import register_modpack_commands
+from .modpack_service import ModpackService
+from .modpack_state import InstallConfirmStore
+
+
+def _modpack_refresh_factory(matcher, event):
+    async def refresh(server):
+        return await _refresh_token_for(
+            server,
+            _interactive_verification_provider(matcher, event, server.account_phone),
+        )
+    return refresh
+
+
+modpack_service = ModpackService(
+    get_server=servers.get_server,
+    build_client=_build_client,
+    build_panel=lambda server: _build_panel_client(server, servers.get_account(server.account_phone)),
+    confirms=InstallConfirmStore(),
+    maintenance=modpack_maintenance,
+    card_operation=card_operation,
+    cancel_background=idle_watcher.mark_closed,
+)
+modpack_commands = register_modpack_commands(
+    servers=servers, service=modpack_service, check_admin=_check_admin_perm,
+    refresh_factory=_modpack_refresh_factory, audit=log_operation,
+    display_name=_user_display_name,
+)

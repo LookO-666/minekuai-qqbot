@@ -4,6 +4,8 @@ Load the selected functions without importing the NoneBot plugin entry point,
 which would register handlers and open its production configuration database.
 """
 import ast
+import importlib
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -12,6 +14,8 @@ import pytest
 
 
 PLUGIN_DIR = Path(__file__).parents[1] / "plugins" / "minekuai"
+sys.path.insert(0, str(PLUGIN_DIR))
+operations = importlib.import_module("operations")
 CALLERS = ("_start_instance", "_with_panel_refresh", "_panel_run_bg", "_mc_cmd")
 
 
@@ -37,7 +41,7 @@ def panel_callers():
     state = SimpleNamespace(
         server=SimpleNamespace(
             name="test", token="old-jwt", client_id="test-client",
-            account_phone="test-account", instance_uuid="test-uuid",
+            account_phone="test-account", instance_uuid="test-uuid", card_id="test-card",
         ),
         account=SimpleNamespace(
             panel_api_key="legacy-key", session_cookie="legacy-cookie",
@@ -89,6 +93,8 @@ def panel_callers():
 
     namespace = {
         "PanelClient": Panel, "AuthError": AuthError,
+        "OperationBusyError": operations.OperationBusyError,
+        "card_operation": operations.card_operation,
         "MinekuaiError": MinekuaiError, "RateLimitError": type("RateLimitError", (MinekuaiError,), {}),
         "MatcherException": Finish, "GroupMessageEvent": Event,
         "CommandArg": lambda: None,
@@ -237,6 +243,28 @@ async def test_legacy_cookie_refresh_can_upgrade_to_jwt(panel_callers, caller):
     assert await _run(state, caller) == "ok"
     assert [args["token"] for args in state.panel_args] == ["", "fresh-jwt"]
     state.namespace["_refresh_token_for"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["maintenance", "card_lock"])
+async def test_console_command_respects_maintenance_and_card_lock(panel_callers, blocker):
+    state = panel_callers
+    previous = operations._maintenance_guard
+
+    def guard(card_id):
+        raise RuntimeError("实例正在维护保护中")
+
+    try:
+        if blocker == "maintenance":
+            operations.set_maintenance_guard(guard)
+            assert "维护保护" in await _run(state, "_mc_cmd")
+        else:
+            async with operations.card_operation(state.server.card_id):
+                assert "正在处理" in await _run(state, "_mc_cmd")
+        assert state.panel_args == []
+        state.namespace["_refresh_token_for"].assert_not_awaited()
+    finally:
+        operations.set_maintenance_guard(previous)
 
 
 @pytest.mark.parametrize("token,client_id,account_phone,expected", [

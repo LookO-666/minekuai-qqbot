@@ -17,6 +17,7 @@ PanelClient 优先使用新版 api.minekuai.cn/panel/... 的 JWT + clientid；
 import asyncio
 import json
 import re
+import unicodedata
 
 from typing import Any
 from urllib.parse import quote, quote_plus, unquote
@@ -100,6 +101,8 @@ class MinekuaiClient:
 
     BASE_URL = "https://api.minekuai.cn"
     DEFAULT_TIMEOUT = 15.0
+    MODPACK_MAX_PAGE = 1000
+    MODPACK_MAX_PAGE_SIZE = 50
 
     def __init__(self, token: str, client_id: str):
         if not token or not client_id:
@@ -191,6 +194,75 @@ class MinekuaiClient:
     async def get_user_packages(self) -> dict:
         """只读查询当前账号的计时卡套餐，不改变计时卡状态。"""
         return await self._request("GET", "/system/timeBalance/user/userPackages")
+
+    @classmethod
+    def _modpack_pagination(cls, page: int, page_size: int) -> None:
+        if type(page) is not int or not 1 <= page <= cls.MODPACK_MAX_PAGE:
+            raise ValueError("整合包页码必须是 1 到 1000 的整数")
+        if type(page_size) is not int or not 1 <= page_size <= cls.MODPACK_MAX_PAGE_SIZE:
+            raise ValueError("整合包每页数量必须是 1 到 50 的整数")
+
+    @staticmethod
+    def _modpack_text(value: Any, label: str, max_length: int) -> str:
+        if (
+            not isinstance(value, str) or not value.strip()
+            or len(value) > max_length
+            or any(unicodedata.category(char).startswith("C") for char in value)
+        ):
+            raise ValueError(f"{label}必须是有效的非空文本，最多 {max_length} 个字符")
+        return value
+
+    @classmethod
+    def _modpack_id(cls, value: Any) -> str:
+        if type(value) is int and value > 0:
+            value = str(value)
+        value = cls._modpack_text(value, "整合包 ID", 128)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            raise ValueError("整合包 ID 格式无效")
+        return value
+
+    async def search_modpacks(
+        self, keyword: str, page: int = 1, page_size: int = 9,
+    ) -> dict:
+        """只读搜索整合包；返回根层 rows/total，不进行 data 解包。"""
+        self._modpack_pagination(page, page_size)
+        keyword = self._modpack_text(keyword, "搜索关键词", 100).strip()
+        return await self._request("GET", "/system/modpacks/list", params={
+            "name": keyword, "primaryId": "", "pageNum": page,
+            "pageSize": page_size, "orderByColumn": "download_count", "isAsc": "desc",
+        })
+
+    async def list_modpack_versions(
+        self, primary_id: str, page: int = 1, page_size: int = 9,
+    ) -> dict:
+        """只读列出指定整合包项目的版本，保持接口的根层 rows/total。"""
+        self._modpack_pagination(page, page_size)
+        primary_id = self._modpack_id(primary_id)
+        return await self._request("GET", "/system/modpacks/list", params={
+            "primaryId": primary_id, "pageNum": page, "pageSize": page_size,
+            "orderByColumn": "createTime", "isAsc": "desc",
+        })
+
+    async def switch_modpack(
+        self, instance_id: str, file_name: str, modpack_id: str,
+    ) -> dict:
+        """覆盖实例全部文件并更换整合包；调用方必须事先取得明确确认。
+
+        只发送一次写请求，认证失败或超时均不在此处自动重试。
+        file_name 必须来自选中的目录记录，保持原值，不改写下载参数。
+        """
+        if not isinstance(instance_id, str) or not re.fullmatch(r"[0-9a-fA-F]{8}", instance_id):
+            raise ValueError("实例 ID 必须是 8 位短 identifier")
+        file_name = self._modpack_text(file_name, "整合包文件名", 2048)
+        modpack_id = self._modpack_id(modpack_id)
+        result = await self._request(
+            "POST", "/system/mineKuaiMinecraft/v2/switchModpack",
+            json={"instanceId": instance_id, "fileName": file_name,
+                  "id": modpack_id, "useExternalUrl": True},
+        )
+        if result.get("code") not in (200, "200", 0, "0"):
+            raise APIError("更换整合包响应缺少成功业务码；结果未确认，请先在官网检查，勿重复安装")
+        return result
 
     async def start_timing(self, card_id: str, *, instance_id: str = "") -> dict:
         """新版按实例开启计费；无实例 ID 时保留旧计时卡操作。"""
