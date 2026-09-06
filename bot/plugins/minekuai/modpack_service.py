@@ -8,11 +8,11 @@ import re
 from loguru import logger
 
 try:
-    from .client import AuthError, MinekuaiError
+    from .client import AuthError, MinekuaiError, _safe_error_text
     from .modpack_catalog import parse_catalog
     from .modpack_state import ServerIdentity, ConfirmError
 except ImportError:
-    from client import AuthError, MinekuaiError
+    from client import AuthError, MinekuaiError, _safe_error_text
     from modpack_catalog import parse_catalog
     from modpack_state import ServerIdentity, ConfirmError
 
@@ -201,7 +201,8 @@ class ModpackService:
     async def install_status(self, server, refresh=None, *, include_billing=True):
         """Reconcile uncertain receipts using fresh installer evidence; never replay writes."""
         identity = ServerIdentity.from_server(server)
-        entry = self.maintenance.get(server.instance_uuid)
+        active_entry = self.maintenance.get(server.instance_uuid)
+        entry = active_entry or self.maintenance.latest(server.instance_uuid)
         info, server = await self.read(server,
             lambda p: p.get_server_info(server.instance_uuid), panel=True, refresh=refresh)
         attr = info.get("attributes") if isinstance(info, dict) else None
@@ -256,15 +257,109 @@ class ModpackService:
                     else:
                         detail = "读取日志期间实例状态发生变化，暂不确认完成"
         self.current(identity)
-        if entry:
-            self.maintenance.observe(entry, outcome)
+        if active_entry:
+            self.maintenance.observe(active_entry, outcome)
         billing = None
         if include_billing:
             try:
                 billing = await self.billing_active(server, str(attr.get("identifier") or ""), refresh)
             except MinekuaiError:
                 pass
-        return {"outcome": outcome, "detail": detail, "billing_active": billing}
+        return {"outcome": outcome, "detail": detail, "billing_active": billing,
+                "maintenance": active_entry is not None, "released": False}
+
+    async def install_log(self, server, refresh=None):
+        identity = ServerIdentity.from_server(server)
+        snapshot = await self._log_snapshot(server, refresh)
+        if not snapshot:
+            return "尚未发现安装日志；请用『整合包状态』继续核对，勿重复安装。"
+        if not snapshot["text"]:
+            return "安装日志为空或超出读取上限；请用『整合包状态』核对任务状态。"
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", snapshot["text"])
+        text = _safe_error_text(text, *(getattr(server, field, "") or "" for field in (
+            "token", "panel_api_key", "session_cookie", "xsrf_token", "panel_session", "panel_xsrf")))
+        # Legacy credentials live on the bound Account rather than Server.
+        # Reuse the actual client's redactor, including individual cookie values.
+        async with self.build_panel(self.current(identity)) as panel:
+            text = panel._error_text(text)
+        self.current(identity)
+        text = re.sub(r"https?://\S+", "[下载链接已隐藏]", text)
+        return "\n".join(text.splitlines()[-30:])[-3000:]
+
+    async def _reconcile_locked(self, identity, *, authorized, refresh=None):
+        """Caller owns the normal per-card/instance lock; no remote mutations."""
+        if not authorized():
+            raise ConfirmError("你当前没有管理员权限")
+        server = self.current(identity)
+        entry = self.maintenance.get(server.instance_uuid)
+        if entry and (entry["server_name"] != server.name or entry["card_id"] != server.card_id
+                      or entry["server_created_at"] != server.created_at
+                      or entry["instance_uuid"].casefold() != server.instance_uuid.casefold()):
+            raise ModpackError("维护记录的原服务器绑定已变化，保护保留，不能自动解除")
+        report = await self.install_status(server, refresh)
+        if entry is None:
+            return report
+        # Always recheck terminal state immediately before releasing protection.
+        info, server = await self.read(server,
+            lambda p: p.get_server_info(server.instance_uuid), panel=True, refresh=refresh)
+        attr = info.get("attributes") if isinstance(info, dict) else None
+        terminal = (isinstance(attr, dict)
+            and server.instance_uuid.casefold() in {
+                str(attr.get("identifier") or "").casefold(), str(attr.get("uuid") or "").casefold()}
+            and attr.get("is_installing") is False
+            and not attr.get("is_transferring") and not attr.get("is_node_under_maintenance"))
+        if entry.get("write_started_at") == 0 and terminal and attr.get("status") in (
+                None, "", "suspended", "install_failed", "reinstall_failed"):
+            report.update(outcome="not_submitted", detail="本次未发送安装请求，已确认没有活跃安装任务")
+        outcome = report["outcome"]
+        allowed = (
+            terminal and (
+                (outcome == "completed" and attr.get("status") in (None, "", "suspended"))
+                or (outcome == "failed" and attr.get("status") in ("install_failed", "reinstall_failed"))
+                or outcome == "not_submitted"
+            )
+        )
+        self.current(identity)
+        if not authorized():
+            raise ConfirmError("权限已变化，未解除维护保护")
+        if not allowed:
+            report.update(maintenance=True, released=False)
+            return report
+        self.maintenance.observe(entry, outcome)
+        self.maintenance.finish(server.instance_uuid, expected=entry, reason=outcome)
+        report.update(maintenance=False, released=True)
+        logger.info("[modpack] instance={} maintenance released outcome={}",
+                    server.instance_uuid[:8], outcome)
+        return report
+
+    async def reconcile_maintenance(self, server, *, authorized, refresh=None):
+        identity = ServerIdentity.from_server(server)
+        async with self.card_operation(server.card_id, allow_maintenance=True):
+            return await self._reconcile_locked(identity, authorized=authorized, refresh=refresh)
+
+    async def reconcile_for_operation(self, server, *, authorized, refresh=None):
+        """Resolve the guard's original owner, never use an alias's credentials on it."""
+        identity = ServerIdentity.from_server(server)
+        if not authorized():
+            raise ConfirmError("你当前没有管理员权限")
+        entry = self.maintenance.find_blocking(server.card_id, server.instance_uuid)
+        if entry is None:
+            return {"maintenance": False, "released": False}
+        owner = self.get_server(entry["server_name"])
+        if (owner is None or owner.card_id != entry["card_id"]
+                or owner.instance_uuid.casefold() != entry["instance_uuid"].casefold()
+                or owner.created_at != entry["server_created_at"]):
+            raise ModpackError("维护记录的原服务器绑定已变化，无法自动解除；请用『整合包状态』核对")
+        report = await self.reconcile_maintenance(owner, authorized=authorized, refresh=refresh)
+        self.current(identity)
+        if not authorized():
+            raise ConfirmError("权限已变化，操作已停止")
+        if report["maintenance"]:
+            raise ModpackError(
+                f"安装任务仍受维护保护：{report['detail']}。"
+                f"请发『整合包状态 {owner.name}』或『整合包日志 {owner.name}』；确认结束后会自动解除"
+            )
+        return report
 
     async def _wait_install_finished(self, identity, refresh=None):
         """Observation expiry is not a failed install, and never causes a new POST."""
@@ -436,7 +531,7 @@ class ModpackService:
                     reason = str(exc) if isinstance(exc, (MinekuaiError, ConfirmError)) else type(exc).__name__
                 raise ModpackError(
                     f"开计时卡或安装前检查未完成：{reason}。未提交更换整合包；"
-                    "计费可能已经开启，维护保护保留，请先到官网核对计费和实例状态；机器人不会自动关卡"
+                    "计费可能已经开启，请发『整合包状态』自动核对并恢复操作；机器人不会自动关卡"
                 ) from None
             receipt_error = None
             try:
@@ -459,8 +554,15 @@ class ModpackService:
                     # A QQ send failure must not prevent observing the write.
                     pass
             outcome = await self._wait_install_finished(pending.server, refresh)
+            report = None
+            if outcome in {"completed", "failed"}:
+                report = await self._reconcile_locked(pending.server, authorized=authorized, refresh=refresh)
             if outcome == "failed":
-                raise ModpackError("官网显示安装失败，维护保护保留；请查看整合包状态和官网安装日志，不会自动重试")
+                raise ModpackError(
+                    "安装失败，任务已结束且保护已自动解除；可发『整合包日志』查看原因，或发『关服』停止计费；不会自动重试"
+                    if report and report["released"] else
+                    "平台显示安装失败，仍在核对任务是否结束；请发『整合包状态』或『整合包日志』，不会自动重试"
+                )
             if outcome != "completed" and receipt_error is not None:
                 raise ModpackError(
                     f"安装请求已发出，但结果未确认：{receipt_error}。"
@@ -469,33 +571,7 @@ class ModpackService:
             return pending
 
     async def finish_maintenance(self, server, *, authorized, refresh=None):
-        identity = ServerIdentity.from_server(server)
-        async with self.card_operation(server.card_id, allow_maintenance=True):
-            if not authorized():
-                raise ConfirmError("你当前没有管理员权限")
-            server = self.current(identity)
-            entry = self.maintenance.get(server.instance_uuid)
-            if not entry:
-                raise ModpackError("该实例没有整合包维护保护")
-            # This command is an explicit human acknowledgment, not an inferred
-            # successful install. Reject active install/transfer states anyway.
-            info, server = await self.read(server,
-                lambda p: p.get_server_info(server.instance_uuid), panel=True, refresh=refresh)
-            attr = info.get("attributes") if isinstance(info, dict) else None
-            if not isinstance(attr, dict) or not attr.get("identifier"):
-                raise ModpackError("实例详情不完整，不能解除维护保护")
-            if server.instance_uuid.casefold() not in {
-                str(attr.get("identifier") or "").casefold(),
-                str(attr.get("uuid") or "").casefold(),
-            }:
-                raise ModpackError("实例详情与绑定不一致，不能解除维护保护")
-            if attr.get("is_installing") or attr.get("is_transferring") or attr.get("status") in ("installing", "reinstalling", "restoring_backup"):
-                raise ModpackError("官网仍显示安装或迁移中，不能解除维护保护")
-            if attr.get("is_node_under_maintenance") or attr.get("status") not in (
-                None, "", "install_failed", "reinstall_failed", "suspended",
-            ):
-                raise ModpackError("官网状态未知或节点维护中，不能解除维护保护")
-            self.current(identity)
-            if not authorized():
-                raise ConfirmError("权限已变化，未解除保护")
-            return self.maintenance.finish(server.instance_uuid)
+        report = await self.reconcile_maintenance(server, authorized=authorized, refresh=refresh)
+        if report["maintenance"]:
+            raise ModpackError("尚未确认安装结束，维护保护保留；请发『整合包状态』或『整合包日志』继续核对")
+        return True

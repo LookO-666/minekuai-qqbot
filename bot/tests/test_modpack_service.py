@@ -87,11 +87,17 @@ def harness(monkeypatch, tmp_path):
         list_directory=AsyncMock(return_value=[]),
         read_file_text=AsyncMock(return_value=""),
         power=AsyncMock(side_effect=power),
+        _error_text=client_mod.PanelClient(
+            api_key="fake-panel-api-key", session_cookie="session=fake-session-secret; locale=zh",
+            xsrf_token="fake-xsrf-secret",
+        )._error_text,
     )
     h.confirms = state_mod.InstallConfirmStore(clock=lambda: h.now)
     h.maintenance = state_mod.MaintenanceStore(tmp_path / "maintenance.db")
     h.maintenance.init_db()
     monkeypatch.setattr(operations, "_card_locks", {})
+    monkeypatch.setattr(operations, "_related_locks", {})
+    monkeypatch.setattr(operations, "_related_lock_keys", None)
     monkeypatch.setattr(operations, "_maintenance_guard", h.maintenance.ensure_card_available)
     monkeypatch.setattr(service_mod, "READY_ATTEMPTS", 5, raising=False)
     monkeypatch.setattr(service_mod, "READY_INTERVAL", 0, raising=False)
@@ -159,6 +165,16 @@ def begin_written_guard(h, baseline="", phase="submitted"):
     h.maintenance.start_write(h.server.instance_uuid, baseline)
     h.maintenance.mark(h.server.instance_uuid, phase)
     return h.maintenance.get(h.server.instance_uuid)
+
+
+def assert_archived(h, outcome):
+    assert h.maintenance.get(h.server.instance_uuid) is None
+    entry = h.maintenance.latest(h.server.instance_uuid)
+    assert entry["install_outcome"] == outcome
+    assert entry["release_reason"] == outcome and entry["released_at"] > 0
+    h.maintenance.ensure_card_available(h.server.card_id)
+    h.maintenance.ensure_instance_available(h.server.instance_uuid)
+    return entry
 
 
 @pytest.mark.parametrize("field,value", [
@@ -1430,7 +1446,7 @@ async def test_one_post_receipt_is_reconciled_by_fresh_success_not_replayed(harn
     assert result is pending
     h.client.switch_modpack.assert_awaited_once_with(IDENTIFIER, pending.choice.file_name, pending.choice.item_id)
     refresh.assert_not_awaited()
-    entry = h.maintenance.get(IDENTIFIER)
+    entry = assert_archived(h, "completed")
     assert entry["write_started_at"] > 0 and entry["baseline_log_stamp"] == ""
     assert entry["install_outcome"] == "completed"
     assert entry["phase"] == ("unknown" if receipt_error else "submitted")
@@ -1458,7 +1474,7 @@ async def test_confirm_records_existing_content_digest_before_exactly_one_post(h
 
     h.client.switch_modpack.side_effect = switch
     assert await h.service.confirm(SCOPE, pending.code, authorized=lambda: True) is pending
-    assert h.maintenance.get(IDENTIFIER)["install_outcome"] == "completed"
+    assert_archived(h, "completed")
     h.client.switch_modpack.assert_awaited_once()
 
 
@@ -1501,10 +1517,10 @@ async def test_explicit_install_failure_is_reported_after_single_post(harness, r
 
     h.client.switch_modpack.side_effect = switch
     h.panel.get_server_info.side_effect = info
-    with pytest.raises(service_mod.ModpackError, match="官网显示安装失败"):
+    with pytest.raises(service_mod.ModpackError, match="安装失败.*保护已自动解除"):
         await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
-    assert h.maintenance.get(IDENTIFIER)["install_outcome"] == "failed"
-    assert observations == ["installing", "install_failed"]
+    assert_archived(h, "failed")
+    assert observations == ["installing", "install_failed", "install_failed", "install_failed"]
     h.client.switch_modpack.assert_awaited_once()
     assert_billing_not_automatically_closed(h)
 
@@ -1564,8 +1580,8 @@ async def test_read_only_polling_can_recover_transient_error_without_second_post
     h.panel.list_directory.side_effect = directory
     h.client.switch_modpack.side_effect = client_mod.APIError("receipt unknown")
     assert await h.service.confirm(SCOPE, pending.code, authorized=lambda: True) is pending
-    assert reads == 2
-    assert h.maintenance.get(IDENTIFIER)["install_outcome"] == "completed"
+    assert reads == 3  # A final read-only reconciliation runs before automatic release.
+    assert_archived(h, "completed")
     h.client.switch_modpack.assert_awaited_once()
 
 
@@ -1600,8 +1616,8 @@ async def test_stale_failure_flag_can_clear_and_later_confirm_fresh_success(harn
     h.panel.list_directory.side_effect = lambda *args: [log] if h.client.switch_modpack.await_count else []
     h.client.switch_modpack.side_effect = client_mod.APIError("receipt unknown")
     assert await h.service.confirm(SCOPE, pending.code, authorized=lambda: True) is pending
-    assert observations == ["install_failed", None, None]
-    assert h.maintenance.get(IDENTIFIER)["install_outcome"] == "completed"
+    assert observations == ["install_failed", None, None, None, None, None]
+    assert_archived(h, "completed")
     h.client.switch_modpack.assert_awaited_once()
 
 
@@ -1664,7 +1680,7 @@ async def test_unknown_panel_observation_retains_installing_evidence_for_later_f
 
 
 @pytest.mark.asyncio
-async def test_full_paused_billing_install_flow_reconciles_bad_receipt_then_explicitly_finishes(harness):
+async def test_full_paused_billing_install_flow_reconciles_bad_receipt_then_automatically_finishes(harness):
     h = harness
     set_billing(h, 0)
     h.info["attributes"].update(is_suspended=True, status="suspended")
@@ -1737,21 +1753,10 @@ async def test_full_paused_billing_install_flow_reconciles_bad_receipt_then_expl
     h.panel.list_directory.side_effect = directory
     h.client.switch_modpack.side_effect = switch
     assert await h.service.confirm(SCOPE, pending.code, authorized=authorized) is pending
-    entry = h.maintenance.get(IDENTIFIER)
+    entry = assert_archived(h, "completed")
     assert entry["phase"] == "unknown" and entry["install_outcome"] == "completed"
-    assert state_mod.MaintenanceStore(h.maintenance.db_path).get(IDENTIFIER) == entry
+    assert state_mod.MaintenanceStore(h.maintenance.db_path).latest(IDENTIFIER) == entry
     events.append("observed-completed")
-    with pytest.raises(state_mod.MaintenanceError):
-        h.maintenance.ensure_card_available(h.server.card_id)
-    with pytest.raises(state_mod.ConfirmError):
-        await h.service.finish_maintenance(h.server, authorized=lambda: False)
-    assert h.maintenance.get(IDENTIFIER) == entry
-
-    def authorize_finish():
-        events.append("finish-authorized")
-        return True
-
-    assert await h.service.finish_maintenance(h.server, authorized=authorize_finish)
     events.append("guard-released")
     assert h.maintenance.get(IDENTIFIER) is None
     h.maintenance.ensure_card_available(h.server.card_id)
@@ -1763,8 +1768,382 @@ async def test_full_paused_billing_install_flow_reconciles_bad_receipt_then_expl
     h.panel.reinstall.assert_not_awaited()
     assert_billing_not_automatically_closed(h)
     important = {"start-billing", "platform-auto-start", "graceful-stop", "write-install",
-                 "observed-installing", "observed-completed", "finish-authorized", "guard-released"}
+                 "observed-installing", "observed-completed", "guard-released"}
     assert [event for event in events if event in important] == [
         "start-billing", "platform-auto-start", "graceful-stop", "write-install",
-        "observed-installing", "observed-completed", "finish-authorized", "finish-authorized", "guard-released",
+        "observed-installing", "observed-completed", "guard-released",
     ]
+
+
+def assert_no_remote_writes(h):
+    h.client.start_timing.assert_not_awaited()
+    h.client.switch_modpack.assert_not_awaited()
+    h.panel.power.assert_not_awaited()
+    assert_billing_not_automatically_closed(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["preparing", "submitted", "unknown"])
+@pytest.mark.parametrize("status", [None, "", "suspended", "install_failed", "reinstall_failed"])
+async def test_reconcile_recovers_prewrite_guard_without_any_remote_write(harness, phase, status):
+    h = harness
+    begin_guard(h, phase)
+    h.info["attributes"]["status"] = status
+    original = h.maintenance.get(IDENTIFIER)
+    assert original["write_started_at"] == 0
+    report = await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    assert report["outcome"] == "not_submitted"
+    assert report["maintenance"] is False and report["released"] is True
+    archived = assert_archived(h, "not_submitted")
+    assert archived["attempt_id"] == original["attempt_id"]
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [
+    {"is_installing": True}, {"is_installing": None}, {"is_installing": 0},
+    {"is_installing": "false"}, {"is_transferring": True},
+    {"is_node_under_maintenance": True}, {"status": "future-status"},
+    {"status": "installing"}, {"status": "reinstalling"}, {"status": "restoring_backup"},
+])
+async def test_reconcile_prewrite_requires_strict_terminal_flags(harness, changes):
+    h = harness
+    begin_guard(h, "unknown")
+    h.info["attributes"].update(changes)
+    report = await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    assert report["maintenance"] is True and report["released"] is False
+    assert h.maintenance.get(IDENTIFIER) is not None
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_missing_installing_flag_cannot_recover_prewrite_guard(harness):
+    h = harness
+    begin_guard(h, "unknown")
+    del h.info["attributes"]["is_installing"]
+    report = await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    assert report["maintenance"] is True and report["released"] is False
+    assert h.maintenance.get(IDENTIFIER) is not None
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["submitted", "unknown"])
+async def test_unknown_written_attempt_cannot_be_manually_acknowledged_away(harness, phase):
+    h = harness
+    begin_written_guard(h, phase=phase)
+    report = await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    assert report["outcome"] == "unknown" and report["maintenance"] is True
+    assert report["released"] is False
+    with pytest.raises(service_mod.ModpackError, match="维护保护保留"):
+        await h.service.finish_maintenance(h.server, authorized=lambda: True)
+    assert h.maintenance.get(IDENTIFIER)["phase"] == phase
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+async def test_reconcile_terminal_attempt_archives_then_finish_is_idempotent(harness, outcome):
+    h = harness
+    entry = begin_written_guard(h, phase="unknown")
+    if outcome == "completed":
+        installer_log(h)
+    else:
+        h.maintenance.observe(entry, "installing")
+        h.info["attributes"]["status"] = "install_failed"
+    report = await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    assert report["outcome"] == outcome
+    assert report["maintenance"] is False and report["released"] is True
+    archived = assert_archived(h, outcome)
+    assert await h.service.finish_maintenance(h.server, authorized=lambda: True)
+    assert h.maintenance.latest(IDENTIFIER) == archived
+    with sqlite3.connect(h.maintenance.db_path) as connection:
+        assert connection.execute("SELECT count(*) FROM modpack_history").fetchone()[0] == 1
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_status_query_reads_history_without_observing_or_releasing_again(harness, monkeypatch):
+    h = harness
+    begin_written_guard(h)
+    installer_log(h)
+    await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    original = assert_archived(h, "completed")
+    observer = Mock(side_effect=AssertionError("history must not be observed as an active guard"))
+    finisher = Mock(side_effect=AssertionError("plain status must not release a guard"))
+    monkeypatch.setattr(h.maintenance, "observe", observer)
+    monkeypatch.setattr(h.maintenance, "finish", finisher)
+    report = await h.service.install_status(h.server)
+    assert report["outcome"] == "completed"
+    assert report["maintenance"] is False and report["released"] is False
+    assert h.maintenance.latest(IDENTIFIER) == original
+    h.panel.list_directory.return_value = []
+    assert (await h.service.install_status(h.server))["outcome"] == "unknown"
+    observer.assert_not_called()
+    finisher.assert_not_called()
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_read_only_status_never_releases_even_a_verified_completed_guard(harness, monkeypatch):
+    h = harness
+    begin_written_guard(h)
+    installer_log(h)
+    finisher = Mock(side_effect=AssertionError("status has no release authority"))
+    monkeypatch.setattr(h.maintenance, "finish", finisher)
+    report = await h.service.install_status(h.server)
+    assert report["outcome"] == "completed"
+    assert report["maintenance"] is True and report["released"] is False
+    assert h.maintenance.get(IDENTIFIER)["install_outcome"] == "completed"
+    finisher.assert_not_called()
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["before", "final"])
+async def test_reconcile_permission_denial_never_releases_completed_guard(harness, stage):
+    h = harness
+    begin_written_guard(h)
+    installer_log(h)
+    allowed = stage != "before"
+    reads = 0
+
+    async def info(*args):
+        nonlocal reads, allowed
+        reads += 1
+        if reads == 3:
+            allowed = False
+        return deepcopy(h.info)
+
+    h.panel.get_server_info.side_effect = info
+    with pytest.raises(state_mod.ConfirmError):
+        await h.service.reconcile_maintenance(h.server, authorized=lambda: allowed)
+    assert reads == (0 if stage == "before" else 3)
+    assert h.maintenance.get(IDENTIFIER) is not None
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [{"is_installing": True}, {"status": "future-state"}, {"is_transferring": True}])
+async def test_reconcile_final_terminal_recheck_prevents_stale_success_release(harness, change):
+    h = harness
+    begin_written_guard(h)
+    installer_log(h)
+    reads = 0
+
+    async def info(*args):
+        nonlocal reads
+        reads += 1
+        result = deepcopy(h.info)
+        if reads >= 3:
+            result["attributes"].update(change)
+        return result
+
+    h.panel.get_server_info.side_effect = info
+    report = await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    assert report["maintenance"] is True and report["released"] is False
+    assert h.maintenance.get(IDENTIFIER) is not None
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_release_happens_inside_existing_operation_lock(harness, monkeypatch):
+    h = harness
+    pending = issue(h)
+    log = installer_log(h)
+    h.panel.list_directory.side_effect = lambda *args: [log] if h.client.switch_modpack.await_count else []
+    original_finish = h.maintenance.finish
+    snapshots = []
+
+    def finish(instance_id, *, expected=None, reason="manual"):
+        assert operations._card_locks[h.server.card_id].locked()
+        assert expected and expected["attempt_id"] == h.maintenance.get(instance_id)["attempt_id"]
+        snapshots.append(expected)
+        return original_finish(instance_id, expected=expected, reason=reason)
+
+    monkeypatch.setattr(h.maintenance, "finish", finish)
+    assert await h.service.confirm(SCOPE, pending.code, authorized=lambda: True) is pending
+    assert len(snapshots) == 1
+    assert_archived(h, "completed")
+    assert not operations._card_locks[h.server.card_id].locked()
+    h.client.switch_modpack.assert_awaited_once()
+    assert_billing_not_automatically_closed(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_release_archive_failure_keeps_guard_and_never_replays_install(harness):
+    h = harness
+    pending = issue(h)
+    log = installer_log(h)
+    h.panel.list_directory.side_effect = lambda *args: [log] if h.client.switch_modpack.await_count else []
+    with sqlite3.connect(h.maintenance.db_path) as connection:
+        connection.execute("CREATE TRIGGER fail_archive BEFORE INSERT ON modpack_history "
+                           "BEGIN SELECT RAISE(ABORT, 'private-archive-failure'); END")
+    with pytest.raises(state_mod.MaintenanceError) as error:
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    assert "private-archive-failure" not in str(error.value)
+    assert h.maintenance.get(IDENTIFIER)["install_outcome"] == "completed"
+    h.client.switch_modpack.assert_awaited_once()
+    with pytest.raises(state_mod.ConfirmError):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    assert h.client.switch_modpack.await_count == 1
+    assert_billing_not_automatically_closed(h)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stale_attempt_cannot_release_replacement_guard(harness):
+    h = harness
+    old = begin_written_guard(h)
+    installer_log(h)
+    reads = 0
+
+    async def info(*args):
+        nonlocal reads
+        reads += 1
+        if reads == 3:
+            h.maintenance.finish(IDENTIFIER, expected=old)
+            begin_written_guard(h)
+        return deepcopy(h.info)
+
+    h.panel.get_server_info.side_effect = info
+    with pytest.raises(state_mod.MaintenanceError, match="维护记录已变化"):
+        await h.service.reconcile_maintenance(h.server, authorized=lambda: True)
+    current = h.maintenance.get(IDENTIFIER)
+    assert current["attempt_id"] != old["attempt_id"] and current["install_outcome"] == "unknown"
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_card", [True, False])
+async def test_reconcile_for_operation_uses_guard_owner_not_target_credentials(harness, same_card):
+    h = harness
+    owner = h.server
+    begin_guard(h, "unknown")
+    target = SimpleNamespace(**{**vars(owner), "name": "other-config", "token": "target-token",
+                               "account_phone": "target-account", "created_at": 200,
+                               "card_id": owner.card_id if same_card else "other-card",
+                               "instance_uuid": "cafebabe" if same_card else UUID})
+    configs = {owner.name: owner, target.name: target}
+    h.service.get_server = configs.get
+    result = await h.service.reconcile_for_operation(target, authorized=lambda: True)
+    assert result["released"] is True and result["maintenance"] is False
+    assert_archived(h, "not_submitted")
+    assert h.built_panels and all(token == owner.token for token, _ in h.built_panels)
+    assert h.built_clients and all(token == owner.token for token, _ in h.built_clients)
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["missing_owner", "card", "instance", "created_at", "unauthorized"])
+async def test_reconcile_for_operation_rejects_unresolved_owner_or_permission(harness, fault):
+    h = harness
+    owner = h.server
+    begin_guard(h, "unknown")
+    target = SimpleNamespace(**{**vars(owner), "name": "other-config", "token": "target-token"})
+    if fault == "card":
+        owner.card_id = "replacement-card"
+    elif fault == "instance":
+        owner.instance_uuid = "cafebabe"
+    elif fault == "created_at":
+        owner.created_at += 1
+    configs = {target.name: target}
+    if fault != "missing_owner":
+        configs[owner.name] = owner
+    h.service.get_server = configs.get
+    expected = state_mod.ConfirmError if fault == "unauthorized" else service_mod.ModpackError
+    with pytest.raises(expected):
+        await h.service.reconcile_for_operation(target, authorized=lambda: fault != "unauthorized")
+    assert h.maintenance.get(IDENTIFIER) is not None
+    h.panel.get_server_info.assert_not_awaited()
+    assert not h.built_clients and not h.built_panels
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_for_operation_unknown_guard_blocks_target_without_writes(harness):
+    h = harness
+    owner = h.server
+    begin_written_guard(h, phase="unknown")
+    target = SimpleNamespace(**{**vars(owner), "name": "alias", "token": "target-token"})
+    h.service.get_server = {owner.name: owner, target.name: target}.get
+    with pytest.raises(service_mod.ModpackError, match="仍受维护保护"):
+        await h.service.reconcile_for_operation(target, authorized=lambda: True)
+    assert h.maintenance.get(IDENTIFIER) is not None
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_install_log_redacts_actual_panel_account_and_server_secrets(harness):
+    h = harness
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJsb2cifQ.signature"
+    secrets = [h.server.token, "fake-panel-api-key", "fake-session-secret", "fake-xsrf-secret", jwt]
+    installer_log(h, text="\x1b[31mprogress\x1b[0m\n" + "\n".join(secrets)
+                  + "\nhttps://download.example.test/private-access-token.zip\nlast useful line\n")
+    text = await h.service.install_log(h.server)
+    assert "progress" in text and "last useful line" in text
+    assert "[REDACTED]" in text and "[下载链接已隐藏]" in text
+    assert "\x1b" not in text and "private-access-token" not in text
+    for secret in secrets:
+        assert secret not in text
+    h.panel.read_file_text.assert_awaited_once_with(IDENTIFIER, "/installserverlogs.log")
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_install_log_returns_only_last_30_lines_and_at_most_3000_characters(harness):
+    h = harness
+    installer_log(h, text="\n".join(f"line-{index:02d} " + "x" * 120 for index in range(50)))
+    text = await h.service.install_log(h.server)
+    assert len(text) <= 3000 and len(text.splitlines()) <= 30
+    assert "line-00" not in text and "line-49" in text
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [
+    ("server_name", "deleted-original-config"), ("card_id", "old-card"),
+    ("server_created_at", 99),
+])
+@pytest.mark.parametrize("method", ["reconcile_maintenance", "finish_maintenance"])
+async def test_direct_reconcile_rejects_guard_bound_to_old_server_configuration(harness, field, value, method):
+    h = harness
+    begin_guard(h, "unknown")
+    with sqlite3.connect(h.maintenance.db_path) as connection:
+        connection.execute(f"UPDATE modpack_maintenance SET {field}=?", (value,))
+    original = h.maintenance.get(IDENTIFIER)
+    with pytest.raises(service_mod.ModpackError, match="绑定"):
+        await getattr(h.service, method)(h.server, authorized=lambda: True)
+    assert h.maintenance.get(IDENTIFIER) == original
+    h.panel.get_server_info.assert_not_awaited()
+    assert_no_remote_writes(h)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_automatic_release_recheck_preserves_written_guard(harness):
+    h = harness
+    pending = issue(h)
+    log = installer_log(h)
+    h.panel.list_directory.side_effect = lambda *args: [log] if h.client.switch_modpack.await_count else []
+    reads_after_post = 0
+
+    async def info(*args):
+        nonlocal reads_after_post
+        if h.client.switch_modpack.await_count:
+            reads_after_post += 1
+            if reads_after_post == 5:
+                raise asyncio.CancelledError()
+        return deepcopy(h.info)
+
+    h.panel.get_server_info.side_effect = info
+    with pytest.raises(asyncio.CancelledError):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    assert reads_after_post == 5
+    entry = h.maintenance.get(IDENTIFIER)
+    assert entry["write_started_at"] > 0 and entry["install_outcome"] == "completed"
+    assert "released_at" not in entry
+    assert not h.confirms.cancel(SCOPE)
+    with pytest.raises(state_mod.ConfirmError):
+        await h.service.confirm(SCOPE, pending.code, authorized=lambda: True)
+    assert h.maintenance.get(IDENTIFIER) == entry
+    h.client.switch_modpack.assert_awaited_once()
+    assert_billing_not_automatically_closed(h)

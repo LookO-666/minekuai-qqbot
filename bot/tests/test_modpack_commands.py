@@ -118,7 +118,8 @@ def ui(monkeypatch):
     project = catalog.CatalogItem("project", "project", "Test Pack", "v1", "1.20.1", "17", "pack.zip")
     version = catalog.CatalogItem("project", "release", "Test Pack", "v2", "1.21.1", "21", "release.zip")
     confirms = state.InstallConfirmStore(clock=lambda: now[0])
-    maintenance = SimpleNamespace(ensure_card_available=Mock(), get=Mock(return_value=None), begin=Mock())
+    maintenance = SimpleNamespace(ensure_card_available=Mock(), get=Mock(return_value=None),
+                                  latest=Mock(return_value=None), begin=Mock())
     service = SimpleNamespace(
         confirms=confirms, maintenance=maintenance,
         current=Mock(return_value=server),
@@ -129,6 +130,12 @@ def ui(monkeypatch):
         install_status=AsyncMock(return_value={
             "outcome": "unknown", "detail": "暂无可确认的本次安装结果", "billing_active": None,
         }),
+        reconcile_maintenance=AsyncMock(return_value={
+            "outcome": "unknown", "detail": "暂无可确认的本次安装结果", "billing_active": None,
+            "maintenance": True, "released": False,
+        }),
+        reconcile_for_operation=AsyncMock(return_value={"maintenance": False, "released": False}),
+        install_log=AsyncMock(return_value="[时间] 正在安装..."),
         finish_maintenance=AsyncMock(),
     )
 
@@ -195,7 +202,7 @@ async def invoke(ui, command, text="", *, event=None, bot=None):
     handlers = ui.registry[command].handlers
     fn = next(iter(handlers.values()))
     with pytest.raises(Finished):
-        if command in {"status", "finish"}:
+        if command in {"status", "finish", "logs"}:
             await fn(matcher, event, Message(text))
         elif command == "cancel":
             await fn(matcher, bot, event)
@@ -238,7 +245,8 @@ async def test_only_explicit_confirmation_calls_install_service_and_reports_subm
     assert "先开启计时卡" in message
     assert "平台若自动启动则正常停服后再安装" in message
     assert "计费可能仍在继续，机器人不会自动关卡" in message
-    assert "我已核对" in message
+    assert "整合包日志 test" in message
+    assert "我已核对" not in message
     assert "✅" not in await invoke(ui, "confirm", code)
 
 
@@ -322,7 +330,7 @@ async def test_cancel_word_stops_selection_before_preparation(ui):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command,text", [
     ("change", "test Test Pack"), ("confirm", "123456"), ("cancel", ""),
-    ("status", "test"), ("finish", "test 我已核对"),
+    ("status", "test"), ("finish", "test"), ("logs", "test"),
 ])
 async def test_all_commands_require_current_admin_permission(ui, command, text):
     ui.allowed[0] = False
@@ -333,6 +341,9 @@ async def test_all_commands_require_current_admin_permission(ui, command, text):
     ui.service.read.assert_not_awaited()
     ui.service.install_status.assert_not_awaited()
     ui.service.finish_maintenance.assert_not_awaited()
+    ui.service.reconcile_maintenance.assert_not_awaited()
+    ui.service.reconcile_for_operation.assert_not_awaited()
+    ui.service.install_log.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -377,46 +388,55 @@ async def test_uninstallable_main_version_is_rejected_without_prepare(ui):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ["test", "test 确认", "test 我已核对 立即", "我已核对"])
-async def test_release_requires_exact_acknowledgment_phrase(ui, text):
+@pytest.mark.parametrize("text", ["test", "test 我已核对", "", "我已核对"])
+async def test_release_no_longer_requires_acknowledgment_but_always_checks_safety(ui, text):
     message = await invoke(ui, "finish", text)
-    assert "我已核对" in message
+    assert "维护保护：保留" in message
+    assert "已自动解除" not in message
+    ui.service.reconcile_maintenance.assert_awaited_once()
+    assert ui.service.reconcile_maintenance.await_args.kwargs["authorized"]()
     ui.service.finish_maintenance.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_acknowledged_release_does_not_claim_installation_success(ui):
-    message = await invoke(ui, "finish", "test 我已核对")
-    ui.service.finish_maintenance.assert_awaited_once()
-    assert ui.service.finish_maintenance.await_args.kwargs["authorized"]()
-    assert "维护保护已解除" in message
-    assert "没有自动开服" in message
-    assert "未据此判定安装成功" in message
-    assert "计时卡没有被自动关闭，计费可能继续" in message
+async def test_safe_unsubmitted_release_does_not_claim_installation_success(ui):
+    ui.service.reconcile_maintenance.return_value.update(
+        outcome="not_submitted", maintenance=False, released=True,
+        detail="本次未发送安装请求且平台无活动安装", billing_active=True,
+    )
+    message = await invoke(ui, "finish", "test")
+    assert "维护保护：已自动解除" in message
+    assert "本次安装观察：未提交安装" in message
+    assert "已确认完成" not in message
+    assert "不会自动启动游戏" in message
+    assert "计费：已开启，正在消耗时长" in message
+    assert "关服 test" in message and "确认关服" in message
     ui.service.confirm.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", [None, "preparing", "submitted", "unknown"])
-async def test_status_query_is_read_only_and_does_not_identify_completed_pack(ui, phase):
+async def test_status_reconciles_without_installing_or_identifying_completed_pack(ui, phase):
     if phase is not None:
-        ui.service.maintenance.get.return_value = {
+        ui.service.maintenance.latest.return_value = {
             "phase": phase, "pack_name": "Test Pack", "pack_version": "v1",
         }
     message = await invoke(ui, "status", "test")
     assert "不代表已识别当前整合包" in message
-    assert "请在官网核对实际文件与版本" in message
     assert "计费：尚未确认，可能仍在消耗时长" in message
     assert "不会自动关卡" in message
-    assert "阶段记录" in message if phase else "不代表当前安装状态" in message
-    ui.service.install_status.assert_awaited_once()
+    assert "维护保护：保留" in message
+    if phase:
+        assert "记录选择：Test Pack · v1" in message
+    ui.service.reconcile_maintenance.assert_awaited_once()
+    ui.service.install_status.assert_not_awaited()
     ui.service.confirm.assert_not_awaited()
     ui.service.finish_maintenance.assert_not_awaited()
 
 
 def test_registers_expected_commands_and_alias(ui):
     assert set(ui.registered) == {
-        "更换整合包", "确认清空安装", "取消更换整合包", "整合包状态", "结束整合包维护",
+        "更换整合包", "确认清空安装", "取消更换整合包", "整合包状态", "结束整合包维护", "整合包日志",
     }
     assert ui.registered["更换整合包"].options["aliases"] == {"切换整合包"}
 
@@ -434,7 +454,7 @@ async def test_overlong_numeric_selection_is_rejected_without_integer_conversion
 
 
 @pytest.mark.asyncio
-async def test_failed_confirmation_warns_about_billing_and_manual_recovery(ui):
+async def test_failed_confirmation_warns_about_billing_and_qq_recovery(ui):
     await choose_release(ui)
     code = current_code(ui)
     ui.service.confirm.side_effect = ui.commands.MinekuaiError("开卡状态未知，未提交安装")
@@ -443,9 +463,10 @@ async def test_failed_confirmation_warns_about_billing_and_manual_recovery(ui):
     assert "维护保护会保留" in message
     assert "计时卡可能已开启并继续消耗时长" in message
     assert "不会自动关卡" in message
-    assert "到官网核对安装与计费" in message
-    assert "任务结束后手动关卡" in message
-    assert "结束整合包维护 <服务器> 我已核对" in message
+    assert "整合包日志 <服务器>" in message
+    assert "确认任务安全结束后会自动解除" in message
+    assert "结束整合包维护 <服务器>" in message
+    assert "我已核对" not in message and "官网" not in message
 
 
 def test_modpack_help_discloses_billing_and_platform_autostart():
@@ -519,7 +540,7 @@ async def test_service_readiness_error_preserves_reason_without_duplicate_warnin
     assert "若已开始开卡或安装" not in message
     assert "计时卡可能已开启并继续消耗时长" not in message
     assert "整合包状态 <服务器>" in message
-    assert "结束整合包维护 <服务器> 我已核对" in message
+    assert "结束整合包维护 <服务器>" in message
     assert "整合包状态 test" not in message
 
 
@@ -549,7 +570,7 @@ async def test_partial_service_warnings_only_add_missing_safety_information(ui, 
 ])
 async def test_confirmation_result_uses_persisted_install_observation(ui, outcome, expected):
     await choose_release(ui)
-    ui.service.maintenance.get.return_value = {"install_outcome": outcome}
+    ui.service.maintenance.latest.return_value = {"install_outcome": outcome}
     message = await invoke(ui, "confirm", current_code(ui))
     assert expected in message
     assert "维护保护已开启" in message
@@ -595,18 +616,153 @@ async def test_explicit_platform_failure_is_not_downgraded_to_accepted(ui):
 async def test_install_status_displays_observed_result_and_billing_without_pack_detection(
     ui, outcome, label, billing, label_billing,
 ):
-    ui.service.install_status.return_value = {
+    ui.service.reconcile_maintenance.return_value = {
         "outcome": outcome,
         "detail": "本次维护期间的安装日志确认成功" if outcome == "completed" else "本次安装观察说明",
         "billing_active": billing,
+        "maintenance": outcome in {"unknown", "installing"},
+        "released": outcome in {"completed", "failed"},
     }
     message = await invoke(ui, "status", "test")
     assert f"本次安装观察：{label}" in message
     assert label_billing in message
     assert "不代表已识别当前整合包" in message
-    assert "不会自动关卡或解除维护保护" in message
+    assert "不会自动关卡" in message
+    assert "官网" not in message
     if outcome == "completed":
         assert "本次维护期间的安装日志确认成功" in message
-    ui.service.install_status.assert_awaited_once()
+    ui.service.reconcile_maintenance.assert_awaited_once()
     ui.service.confirm.assert_not_awaited()
     ui.service.finish_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_displays_archived_completion_and_qq_power_commands(ui):
+    await choose_release(ui)
+    ui.service.maintenance.latest.return_value = {
+        "install_outcome": "completed", "released_at": 1234567890,
+        "pack_name": "Test Pack", "pack_version": "v1",
+    }
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert "安装已确认完成" in message
+    assert "维护保护已自动解除" in message
+    assert "安装结果已归档" in message
+    assert "开服 test" in message
+    assert "关服 test" in message and "确认关服" in message
+    assert "官网" not in message and "我已核对" not in message
+    assert "维护保护已开启" not in message
+    ui.service.maintenance.latest.assert_called_once_with("instance")
+    ui.service.maintenance.get.assert_not_called()
+    ui.service.reconcile_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_history_read_failure_never_claims_release(ui):
+    await choose_release(ui)
+    ui.service.maintenance.latest.side_effect = RuntimeError("unavailable")
+    message = await invoke(ui, "confirm", current_code(ui))
+    assert "尚未确认完成" in message
+    assert "维护保护已开启" in message
+    assert "已自动解除" not in message
+    assert "整合包状态 test" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["status", "finish"])
+@pytest.mark.parametrize("report", [
+    None, {}, {"maintenance": False}, {"maintenance": "false", "released": True},
+    {"maintenance": True, "released": True}, {"maintenance": False, "released": 1},
+])
+async def test_invalid_reconciliation_result_never_claims_released(ui, command, report):
+    ui.service.reconcile_maintenance.return_value = report
+    message = await invoke(ui, command, "test")
+    assert "结果格式异常" in message
+    assert "已自动解除" not in message
+    assert "开服 test" not in message
+    ui.service.confirm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["unknown", "installing"])
+async def test_legacy_acknowledgment_cannot_override_active_or_uncertain_task(ui, outcome):
+    ui.service.reconcile_maintenance.return_value.update(outcome=outcome)
+    message = await invoke(ui, "finish", "test 我已核对")
+    assert "维护保护：保留" in message
+    assert "已自动解除" not in message
+    assert "不要重新安装" in message
+    ui.service.finish_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_logs_show_service_redacted_excerpt_without_install_or_release(ui):
+    ui.service.install_log.return_value = "[10:00] 下载完成\n[10:01] token=[已脱敏]"
+    message = await invoke(ui, "logs", "test")
+    assert "安装日志（已脱敏，最近片段）" in message
+    assert "token=[已脱敏]" in message
+    assert "整合包状态 test" in message
+    ui.service.install_log.assert_awaited_once_with(ui.server, refresh=None)
+    ui.service.reconcile_maintenance.assert_not_awaited()
+    ui.service.confirm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_logs_use_single_server_default_and_bound_output(ui):
+    ui.service.install_log.return_value = "x" * 4000
+    message = await invoke(ui, "logs")
+    assert "x" * 3000 in message
+    assert "x" * 3001 not in message
+    ui.service.install_log.assert_awaited_once_with(ui.server, refresh=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, {}, []])
+async def test_logs_reject_malformed_service_result(ui, payload):
+    ui.service.install_log.return_value = payload
+    assert "安装日志格式异常" in await invoke(ui, "logs", "test")
+    ui.service.reconcile_maintenance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_selection_reconciles_old_guard_before_entry_check_and_preparation(ui):
+    events = []
+
+    async def reconcile(*args, **kwargs):
+        assert args == (ui.server,)
+        assert kwargs["authorized"]()
+        events.append("reconcile")
+
+    ui.service.reconcile_for_operation.side_effect = reconcile
+    ui.service.maintenance.ensure_card_available.side_effect = lambda card: events.append("guard")
+    original = ui.service.prepare.side_effect
+
+    async def prepare(*args, **kwargs):
+        events.append("prepare")
+        return await original(*args, **kwargs)
+
+    ui.service.prepare.side_effect = prepare
+    await choose_release(ui)
+    assert events == ["reconcile", "guard", "reconcile", "prepare"]
+    assert ui.service.reconcile_for_operation.await_count == 2
+    ui.service.confirm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_still_protected_previous_install_blocks_selection_before_catalog(ui):
+    ui.service.reconcile_for_operation.side_effect = ui.commands.MinekuaiError("安装任务仍受维护保护")
+    handlers = ui.registry["change"].handlers
+    await handlers["begin"](ui.matcher, ui.bot, ui.event, Message("test Test Pack"))
+    with pytest.raises(Finished, match="仍受维护保护"):
+        await handlers["choose_server"](ui.matcher, ui.bot, ui.event, "test")
+    ui.service.preflight.assert_not_awaited()
+    ui.service.search.assert_not_awaited()
+    ui.service.prepare.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guard_appearing_during_selection_blocks_before_new_confirmation(ui):
+    await choose_project(ui)
+    ui.service.reconcile_for_operation.side_effect = ui.commands.MinekuaiError("仍有活动安装")
+    with pytest.raises(Finished, match="仍有活动安装"):
+        await ui.registry["change"].handlers["choose_version"](ui.matcher, ui.bot, ui.event, "0")
+    ui.service.prepare.assert_not_awaited()
+    ui.service.confirm.assert_not_awaited()

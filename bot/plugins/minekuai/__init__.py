@@ -86,7 +86,7 @@ from .client import (
     RateLimitError,
 )
 from .config import Config
-from .modpack_state import MaintenanceError, MaintenanceStore
+from .modpack_state import ConfirmError, MaintenanceError, MaintenanceStore, ServerIdentity
 from .operations import (
     OperationBusyError, card_operation, ensure_card_available, set_maintenance_guard,
     set_related_lock_keys,
@@ -733,6 +733,60 @@ async def _start_instance(
 # 指令: 开服
 # ============================================================
 
+
+def _manual_control_current(event, identity, *, admin=False):
+    """Recheck permission and binding after any asynchronous reconciliation."""
+    allowed, reason = (_check_admin_perm(event) if admin else _check_perm(event))
+    if not allowed:
+        raise OperationBusyError(reason or "权限已变化，已停止本次操作")
+    return modpack_service.current(identity)
+
+
+async def _reconcile_manual_control(matcher, event, server, *, admin=False):
+    """Only explicit user controls may reconcile completed installation guards."""
+    identity = ServerIdentity.from_server(server)
+
+    def authorized():
+        return (_check_admin_perm(event) if admin else _check_perm(event))[0]
+
+    try:
+        server = _manual_control_current(event, identity, admin=admin)
+        report = await modpack_service.reconcile_for_operation(
+            server, authorized=authorized,
+            refresh=_modpack_refresh_factory(matcher, event),
+        )
+        server = _manual_control_current(event, identity, admin=admin)
+        if not isinstance(report, dict) or report.get("maintenance") is not False:
+            raise OperationBusyError(
+                "安装维护状态尚未确认，请在群里发『整合包状态』或『整合包日志』查看"
+            )
+        if report.get("released"):
+            await matcher.send("✅ 已确认上次整合包安装结束，维护保护已自动解除，继续本次操作。")
+        return server
+    except (OperationBusyError, MaintenanceError, MinekuaiError, ConfirmError) as exc:
+        await matcher.finish(str(exc))
+
+
+async def _manual_start_billing_status(matcher, event, server):
+    """Read the exact instance's billing state before a manual start may write."""
+    identity = ServerIdentity.from_server(server)
+    server = _manual_control_current(event, identity)
+    instance = server.instance_uuid
+    if not instance:
+        return server, False  # Legacy card-only setups keep their existing workflow.
+    if (not isinstance(instance, str) or re.fullmatch(
+            r"(?:[0-9a-fA-F]{8}|[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})",
+            instance) is None):
+        raise MinekuaiError("实例 ID 格式无效，无法确认计费状态，未发送开卡请求")
+    active = await modpack_service.billing_active(
+        server, instance[:8].lower(), refresh=_modpack_refresh_factory(matcher, event),
+    )
+    server = _manual_control_current(event, identity)
+    if type(active) is not bool:
+        raise MinekuaiError("实例计费状态未知，未发送开卡请求")
+    return server, active
+
+
 start_cmd = on_command(
     "开服",
     aliases={"开机", "start", "Start", "START"},
@@ -794,17 +848,22 @@ async def _start_step(
             f"找不到服务器『{name}』。请重输或发『取消』。"
         )
 
+    identity = ServerIdentity.from_server(server)
     try:
+        server = await _reconcile_manual_control(matcher, event, server)
         async with card_operation(server.card_id):
+            server = _manual_control_current(event, identity)
             idle_watcher.cancel_keepalive(server.name)
             await _start_server_locked(matcher, event, server)
-    except OperationBusyError as e:
+    except (OperationBusyError, MaintenanceError, MinekuaiError, ConfirmError) as e:
         await matcher.finish(str(e))
 
 
 async def _start_server_locked(
     matcher: Matcher, event: MessageEvent, server: servers.Server,
 ):
+    identity = ServerIdentity.from_server(server)
+    server = _manual_control_current(event, identity)
     user_id = event.user_id
     group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
     user_name = _user_display_name(event)
@@ -828,7 +887,7 @@ async def _start_server_locked(
                 f"❌ 『{server.name}』自动获取 token 失败：{msg}\n"
                 f"请用『更新token {server.name}』手动填一份"
             )
-        server = servers.get_server(server.name)
+        server = _manual_control_current(event, identity)
     if not server.token or not server.client_id:
         await matcher.finish(
             f"❌ 『{server.name}』没有 token 也没绑账号。\n"
@@ -836,24 +895,32 @@ async def _start_server_locked(
             f"『更新token {server.name}』手动填"
         )
 
-    await matcher.send(f"正在开启『{server.name}』的计时卡...")
+    await matcher.send(f"正在核对『{server.name}』计时卡并准备启动...")
 
     refresh_attempted = False
     while True:
         try:
-            # 第 1 步：开计时卡（Bearer JWT）
-            async with _build_client(server) as client:
-                await client.open_timing_only(
-                    card_id=server.card_id, instance_id=server.instance_uuid,
-                )
+            # An install leaves billing active. Do not reopen it before starting
+            # the game: an already-active/rate-limited POST can interrupt that flow.
+            server = _manual_control_current(event, identity)
+            server, billing_active = await _manual_start_billing_status(matcher, event, server)
+            if not billing_active:
+                server = _manual_control_current(event, identity)
+                async with _build_client(server) as client:
+                    await client.open_timing_only(
+                        card_id=server.card_id,
+                        instance_id=server.instance_uuid[:8].lower() if server.instance_uuid else "",
+                    )
 
             # 第 2 步：实例启动（复用 JWT，账号只用于自动续期）
             instance_msg = ""
             instance_started = False
             if server.instance_uuid:
-                # 计时卡刚开，给后端 2 秒同步
-                import asyncio as _asyncio
-                await _asyncio.sleep(2)
+                if not billing_active:
+                    # 计时卡刚开，给后端 2 秒同步
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(2)
+                server = _manual_control_current(event, identity)
                 ok, msg = await _start_instance(matcher, event, server)
                 if ok:
                     instance_msg = " + 实例启动指令已下达"
@@ -899,7 +966,7 @@ async def _start_server_locked(
                     server, verification_provider
                 )
                 if ok:
-                    server = servers.get_server(server.name)
+                    server = _manual_control_current(event, identity)
                     continue
                 log_operation(
                     user_id, user_name, group_id,
@@ -927,10 +994,10 @@ async def _start_server_locked(
             )
             await matcher.finish(
                 f"ℹ️ 『{server.name}』计时卡可能已开启（操作太频繁）。\n"
-                f"如果服务器还没运行，请联系管理员手动启动。"
+                f"可发『查服 {server.name}』核对状态；下次开服会先检查计费，避免重复开卡。"
             )
 
-        except MinekuaiError as e:
+        except (MinekuaiError, OperationBusyError, ConfirmError) as e:
             log_operation(
                 user_id, user_name, group_id,
                 f"start {server.name}", False, str(e),
@@ -1040,11 +1107,14 @@ async def _do_stop(
     user_name: str,
     server: servers.Server,
 ):
+    identity = ServerIdentity.from_server(server)
     try:
+        server = await _reconcile_manual_control(matcher, event, server)
         async with card_operation(server.card_id):
+            server = _manual_control_current(event, identity)
             idle_watcher.cancel_keepalive(server.name)
             await _stop_server_locked(matcher, event, user_name, server)
-    except OperationBusyError as e:
+    except (OperationBusyError, MaintenanceError, MinekuaiError, ConfirmError) as e:
         await matcher.finish(str(e))
 
 
@@ -3542,9 +3612,13 @@ async def _restart(
             f"🛠 {server.name}\n未配置实例 UUID,无法重启"
         )
 
+    identity = ServerIdentity.from_server(server)
+    server = await _reconcile_manual_control(matcher, event, server, admin=True)
+
     async def _do(panel: PanelClient):
         async with card_operation(server.card_id):
-            await panel.power(server.instance_uuid, "restart")
+            current = _manual_control_current(event, identity, admin=True)
+            await panel.power(current.instance_uuid, "restart")
         return True
 
     result, msg, server = await _with_panel_refresh(
@@ -3591,8 +3665,10 @@ MODPACK_HELP = (
     "先开计时卡（消耗时长），平台若自动启动则正常停服后安装，不强杀\n"
     "开卡或就绪失败不安装，保护保留；不会自动关卡，计费可能继续\n"
     "取消更换整合包｜撤销未提交的确认\n"
-    "整合包状态 [服务器]｜查看提交状态与维护保护\n"
-    "结束整合包维护 <服务器> 我已核对｜官网核对安装/计费、手动关卡后解除保护\n"
+    "整合包状态 [服务器]｜群内自动核对安装结果，已结束时自动解除维护保护\n"
+    "整合包日志 [服务器]｜群内查看安装日志，无需离开 QQ\n"
+    "结束整合包维护 <服务器>｜让机器人核对并解除已结束安装的保护\n"
+    "开服 / 关服 / 重启会先核对遗留维护；安装中或结果未知仍会阻止操作\n"
 )
 
 

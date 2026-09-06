@@ -3,6 +3,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 import math
+import json
 import re
 import secrets
 import sqlite3
@@ -141,8 +142,8 @@ class InstallConfirmStore:
 class MaintenanceStore:
     """File-backed protection that survives config deletion and process restart.
 
-    Every stored row is active, regardless of age or phase. Only an explicit
-    ``finish`` call removes it; installation submission isn't completion.
+    Active rows survive restarts regardless of age or phase. A verified terminal
+    reconciliation archives them separately; submission alone is never completion.
     """
 
     def __init__(self, db_path: str | Path):
@@ -190,6 +191,11 @@ class MaintenanceStore:
                 ):
                     if name not in columns:
                         connection.execute(f"ALTER TABLE modpack_maintenance ADD COLUMN {name} {definition}")
+                connection.execute("""CREATE TABLE IF NOT EXISTS modpack_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance_uuid TEXT NOT NULL COLLATE NOCASE,
+                    record TEXT NOT NULL
+                )""")
         except (OSError, sqlite3.Error):
             raise MaintenanceError("无法初始化整合包维护保护，操作已停止") from None
 
@@ -204,7 +210,7 @@ class MaintenanceStore:
                 connection.execute("BEGIN IMMEDIATE")
                 if self._has_instance_guard(connection, server.instance_uuid):
                     raise MaintenanceError(
-                        "该实例已有整合包维护保护，请先确认官网状态并由管理员解除",
+                        "该实例已有整合包维护保护，请发『整合包状态』，确认结束后会自动解除",
                     )
                 connection.execute(
                     """INSERT INTO modpack_maintenance
@@ -219,7 +225,7 @@ class MaintenanceStore:
                 )
         except sqlite3.IntegrityError:
             raise MaintenanceError(
-                "该实例或计时卡已有整合包维护保护，请先确认官网状态并由管理员解除",
+                "该实例或计时卡已有整合包维护保护，请发『整合包状态』自动核对",
             ) from None
         except (OSError, sqlite3.Error):
             raise MaintenanceError("无法保存整合包维护保护，操作已停止") from None
@@ -256,7 +262,7 @@ class MaintenanceStore:
 
     def observe(self, entry: dict, outcome: str) -> None:
         """Record read-only evidence without releasing protection or changing receipt state."""
-        if outcome not in {"unknown", "installing", "completed", "failed"}:
+        if outcome not in {"unknown", "installing", "completed", "failed", "not_submitted"}:
             raise MaintenanceError("无效的安装观察状态")
         try:
             with closing(self._connect()) as connection, connection:
@@ -290,7 +296,7 @@ class MaintenanceStore:
                 ).fetchone()
                 if row is not None:
                     raise MaintenanceError(
-                        "计时卡处于整合包维护保护中，请先在官网确认安装完成，再由管理员解除保护",
+                        "计时卡处于整合包维护保护中，请发『整合包状态 <服务器>』自动核对；也可用『整合包日志 <服务器>』查看进度",
                     )
         except (OSError, sqlite3.Error):
             raise MaintenanceError("无法检查整合包维护保护，操作已停止") from None
@@ -309,17 +315,59 @@ class MaintenanceStore:
             with closing(self._connect()) as connection:
                 if self._has_instance_guard(connection, instance_id):
                     raise MaintenanceError(
-                        "实例处于整合包维护保护中，请先在官网核对结果，再由管理员解除保护",
+                        "实例处于整合包维护保护中，请发『整合包状态 <服务器>』自动核对安装结果",
                     )
         except (OSError, sqlite3.Error):
             raise MaintenanceError("无法检查实例维护保护，操作已停止") from None
 
-    def finish(self, instance_id: str) -> bool:
+    def latest(self, instance_id: str) -> dict | None:
+        active = self.get(instance_id)
+        if active:
+            return active
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT record FROM modpack_history WHERE instance_uuid=? ORDER BY id DESC LIMIT 1",
+                    (instance_id,),
+                ).fetchone()
+                return json.loads(row[0]) if row else None
+        except (OSError, sqlite3.Error, ValueError):
+            raise MaintenanceError("无法读取整合包安装历史，请稍后重试") from None
+
+    def find_blocking(self, card_id: str, instance_id: str) -> dict | None:
+        try:
+            with closing(self._connect()) as connection:
+                for row in connection.execute("SELECT * FROM modpack_maintenance"):
+                    if row["card_id"] == card_id or (instance_id and _same_instance(row["instance_uuid"], instance_id)):
+                        return dict(row)
+                return None
+        except (OSError, sqlite3.Error):
+            raise MaintenanceError("无法核对关联整合包维护记录") from None
+
+    def finish(self, instance_id: str, *, expected: dict | None = None, reason="manual") -> bool:
+        if reason not in {"manual", "completed", "failed", "not_submitted"}:
+            raise MaintenanceError("无效的维护结束原因")
         try:
             with closing(self._connect()) as connection, connection:
-                result = connection.execute(
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM modpack_maintenance WHERE instance_uuid=?", (instance_id,),
+                ).fetchone()
+                if row is None:
+                    if expected is not None:
+                        raise MaintenanceError("维护记录已变化，未解除其他任务的保护")
+                    return False
+                entry = dict(row)
+                if expected is not None and any(entry.get(key) != expected.get(key) for key in (
+                    "attempt_id", "created_at", "card_id", "server_created_at", "write_started_at",
+                )):
+                    raise MaintenanceError("维护记录已变化，未解除其他任务的保护")
+                archived = {**entry, "released_at": int(time.time()), "release_reason": reason}
+                connection.execute("INSERT INTO modpack_history(instance_uuid,record) VALUES (?,?)",
+                                   (instance_id, json.dumps(archived, ensure_ascii=False)))
+                connection.execute(
                     "DELETE FROM modpack_maintenance WHERE instance_uuid = ?", (instance_id,),
                 )
-                return result.rowcount == 1
+                return True
         except (OSError, sqlite3.Error):
             raise MaintenanceError("无法解除整合包维护保护，请检查后重试") from None

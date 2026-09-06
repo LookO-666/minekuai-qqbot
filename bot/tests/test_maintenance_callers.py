@@ -39,7 +39,7 @@ def handlers():
 
     server = SimpleNamespace(
         name="test", card_id="maintenance-test-card", instance_uuid="instance",
-        account_phone="account", address="example.invalid:25565",
+        account_phone="account", address="example.invalid:25565", created_at=123,
     )
     state = SimpleNamespace(
         server=server, servers=[server], event=Event(),
@@ -61,6 +61,7 @@ def handlers():
     writes.get_server = lambda name: next((s for s in state.servers if s.name == name), None)
     writes.list_servers = lambda: state.servers
     writes.get_account = lambda phone: SimpleNamespace(phone=phone, password="test-password")
+    state.reconcile = AsyncMock(return_value={"released": False, "maintenance": False})
 
     async def with_panel(matcher, event, target, fn):
         try:
@@ -77,7 +78,15 @@ def handlers():
         "card_operation": operations.card_operation,
         "ensure_card_available": operations.ensure_card_available,
         "MaintenanceError": modpack_state.MaintenanceError,
+        "ConfirmError": modpack_state.ConfirmError,
+        "ServerIdentity": modpack_state.ServerIdentity,
+        "MinekuaiError": RuntimeError,
         "modpack_maintenance": state.maintenance,
+        "modpack_service": SimpleNamespace(
+            reconcile_for_operation=state.reconcile,
+            current=lambda identity: writes.get_server(identity.name),
+        ),
+        "_modpack_refresh_factory": lambda matcher, event: AsyncMock(),
         "auth": state.auth,
         "_interactive_verification_provider": lambda *args: None,
         "servers": writes,
@@ -103,6 +112,7 @@ def handlers():
         "_ensure_server_config_mutable", "_ensure_instance_config_mutable",
         "_ensure_new_server_config_mutable", "_configured_card_maintenance_guard",
         "_configured_instance_lock_keys",
+        "_manual_control_current", "_reconcile_manual_control",
         "_restart", "_chat_relay", "_addr_update_finish",
         "_uuid_update_finish", "_del_finish", "_rename_finish", "_del_account_finish",
         "_bind_account", "_auto_close", "_add_finish",

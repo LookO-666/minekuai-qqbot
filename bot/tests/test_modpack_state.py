@@ -432,7 +432,7 @@ def test_concurrent_start_write_records_exactly_one_baseline(state, store, serve
     assert store.get(server.instance_uuid)["baseline_log_stamp"] == f"baseline-{winners[0]}"
 
 
-@pytest.mark.parametrize("outcome", ["unknown", "installing", "completed", "failed"])
+@pytest.mark.parametrize("outcome", ["unknown", "installing", "completed", "failed", "not_submitted"])
 def test_observation_persists_outcome_but_never_releases_maintenance(state, store, server, choice, outcome):
     store.begin(state.ServerIdentity.from_server(server), choice)
     store.start_write(server.instance_uuid, "baseline")
@@ -522,3 +522,155 @@ def test_unknown_observation_keeps_prior_evidence_for_same_attempt(state, store,
     store.observe(entry, prior)
     store.observe(store.get(server.instance_uuid), "unknown")
     assert store.get(server.instance_uuid)["install_outcome"] == prior
+
+
+@pytest.mark.parametrize("reason", ["manual", "completed", "failed", "not_submitted"])
+def test_finish_atomically_archives_public_record_and_survives_restart(
+    state, store, server, choice, monkeypatch, reason,
+):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    original = store.get(server.instance_uuid)
+    monkeypatch.setattr(state.time, "time", lambda: 2000000000)
+    assert store.finish(server.instance_uuid, expected=original, reason=reason)
+    assert store.get(server.instance_uuid) is None
+    archived = {**original, "released_at": 2000000000, "release_reason": reason}
+    assert store.latest(server.instance_uuid) == archived
+    restarted = state.MaintenanceStore(store.db_path)
+    restarted.init_db()
+    assert restarted.latest(server.instance_uuid.upper()) == archived
+    restarted.ensure_card_available(server.card_id)
+    restarted.ensure_instance_available(server.instance_uuid)
+    raw = store.db_path.read_bytes()
+    for secret in (server.token, server.account_phone, choice.file_name, choice.search_query):
+        assert secret.encode() not in raw
+
+
+def test_latest_prefers_active_guard_then_most_recent_archive(state, store, server, choice):
+    identity = state.ServerIdentity.from_server(server)
+    assert store.latest(server.instance_uuid) is None
+    store.begin(identity, choice)
+    first = store.get(server.instance_uuid)
+    store.finish(server.instance_uuid, expected=first, reason="completed")
+    store.begin(identity, replace(choice, name="second pack"))
+    second = store.get(server.instance_uuid)
+    assert store.latest(server.instance_uuid) == second
+    assert "released_at" not in second
+    store.finish(server.instance_uuid, expected=second, reason="failed")
+    latest = store.latest(server.instance_uuid)
+    assert latest["attempt_id"] == second["attempt_id"] != first["attempt_id"]
+    assert latest["pack_name"] == "second pack" and latest["release_reason"] == "failed"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("attempt_id", "stale-attempt"), ("created_at", -1), ("card_id", "other-card"),
+    ("server_created_at", -1), ("write_started_at", -1),
+])
+def test_finish_expected_snapshot_mismatch_never_deletes_or_archives(
+    state, store, server, choice, field, value,
+):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    original = store.get(server.instance_uuid)
+    with pytest.raises(state.MaintenanceError):
+        store.finish(server.instance_uuid, expected={**original, field: value}, reason="completed")
+    assert store.get(server.instance_uuid) == original
+    with sqlite3.connect(store.db_path) as connection:
+        assert connection.execute("SELECT count(*) FROM modpack_history").fetchone()[0] == 0
+
+
+def test_same_second_stale_finish_cannot_release_new_attempt(state, store, server, choice, monkeypatch):
+    monkeypatch.setattr(state.time, "time", lambda: 100)
+    identity = state.ServerIdentity.from_server(server)
+    store.begin(identity, choice)
+    old = store.get(server.instance_uuid)
+    store.finish(server.instance_uuid, expected=old)
+    store.begin(identity, choice)
+    new = store.get(server.instance_uuid)
+    with pytest.raises(state.MaintenanceError):
+        store.finish(server.instance_uuid, expected=old, reason="completed")
+    assert store.get(server.instance_uuid) == new
+    with sqlite3.connect(store.db_path) as connection:
+        assert connection.execute("SELECT count(*) FROM modpack_history").fetchone()[0] == 1
+
+
+def test_concurrent_finish_expected_snapshot_archives_exactly_once(state, store, server, choice):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    entry = store.get(server.instance_uuid)
+    barrier = threading.Barrier(2)
+
+    def finish():
+        barrier.wait()
+        try:
+            return state.MaintenanceStore(store.db_path).finish(
+                server.instance_uuid, expected=entry, reason="completed",
+            )
+        except state.MaintenanceError:
+            return False
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert sorted(executor.map(lambda _: finish(), range(2))) == [False, True]
+    assert store.get(server.instance_uuid) is None
+    with sqlite3.connect(store.db_path) as connection:
+        assert connection.execute("SELECT count(*) FROM modpack_history").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["archive", "delete"])
+def test_archive_or_delete_failure_rolls_back_both_operations(state, store, server, choice, failure_stage):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    original = store.get(server.instance_uuid)
+    table, action = ("modpack_history", "INSERT") if failure_stage == "archive" else ("modpack_maintenance", "DELETE")
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute(
+            f"CREATE TRIGGER injected_failure BEFORE {action} ON {table} "
+            "BEGIN SELECT RAISE(ABORT, 'private-storage-error'); END"
+        )
+    with pytest.raises(state.MaintenanceError) as error:
+        store.finish(server.instance_uuid, expected=original, reason="completed")
+    assert "private-storage-error" not in str(error.value)
+    assert store.get(server.instance_uuid) == original
+    with sqlite3.connect(store.db_path) as connection:
+        assert connection.execute("SELECT count(*) FROM modpack_history").fetchone()[0] == 0
+    with pytest.raises(state.MaintenanceError):
+        store.ensure_card_available(server.card_id)
+
+
+@pytest.mark.parametrize("query_card,query_instance,blocked", [
+    ("test-card", "other-instance", True),
+    ("another-card", "abcd1234", True),
+    ("another-card", FULL_ID.upper(), True),
+    ("another-card", FULL_ID.replace("-", ""), True),
+    ("another-card", "abcd1234-extra", False),
+    ("another-card", "cafe1234", False),
+])
+def test_find_blocking_matches_card_or_valid_instance_alias_only_active(
+    state, store, server, choice, query_card, query_instance, blocked,
+):
+    identity = replace(state.ServerIdentity.from_server(server), instance_uuid=FULL_ID)
+    store.begin(identity, choice)
+    original = store.get(FULL_ID)
+    assert store.find_blocking(query_card, query_instance) == (original if blocked else None)
+    store.finish(FULL_ID, expected=original, reason="completed")
+    assert store.find_blocking(query_card, query_instance) is None
+
+
+@pytest.mark.parametrize("reason", ["arbitrary-secret", "", None, True, 1])
+def test_invalid_archive_reason_never_releases_guard(state, store, server, choice, reason):
+    store.begin(state.ServerIdentity.from_server(server), choice)
+    original = store.get(server.instance_uuid)
+    with pytest.raises(state.MaintenanceError):
+        store.finish(server.instance_uuid, expected=original, reason=reason)
+    assert store.get(server.instance_uuid) == original
+
+
+def test_latest_and_find_blocking_storage_errors_fail_closed(state, tmp_path):
+    store = state.MaintenanceStore(tmp_path / "missing-history.db")
+    with pytest.raises(state.MaintenanceError):
+        store.latest("abcd1234")
+    with pytest.raises(state.MaintenanceError):
+        store.find_blocking("card", "abcd1234")
+
+
+def test_invalid_history_json_never_looks_like_a_finished_install(state, store):
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("INSERT INTO modpack_history(instance_uuid,record) VALUES (?,?)", ("abcd1234", "not JSON"))
+    with pytest.raises(state.MaintenanceError):
+        store.latest("abcd1234")

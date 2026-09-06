@@ -34,6 +34,19 @@ def test_all_billing_calls_forward_matching_instance_id(function, call):
     card = kwargs["card_id"]
     instance = kwargs["instance_id"]
     assert isinstance(card, ast.Attribute) and card.attr == "card_id"
+    if function == "_start_server_locked":
+        # Manual start validates the complete ID before normalizing it to the
+        # official per-instance billing endpoint's short identifier.
+        assert isinstance(card.value, ast.Name) and card.value.id == "server"
+        expected = ast.parse('server.instance_uuid[:8].lower() if server.instance_uuid else ""', mode="eval").body
+        assert ast.dump(instance) == ast.dump(expected)
+        expression = compile(ast.Expression(instance), "manual-start-instance", "eval")
+        for saved, short in [
+            ("deadbeef", "deadbeef"), ("DEADBEEF", "deadbeef"),
+            ("DEADBEEF-1234-5678-90AB-1234567890AB", "deadbeef"), ("", ""),
+        ]:
+            assert eval(expression, {"server": SimpleNamespace(instance_uuid=saved)}) == short
+        return
     assert isinstance(instance, ast.Attribute) and instance.attr == "instance_uuid"
     assert ast.dump(card.value) == ast.dump(instance.value)
 
