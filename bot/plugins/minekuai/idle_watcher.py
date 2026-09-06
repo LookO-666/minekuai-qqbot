@@ -42,6 +42,7 @@ SLP_TIMEOUT_SECONDS = 5          # SLP 单次查询超时
 SLP_BACKOFF_SECONDS = (30, 60, 120, 300)  # 连续失败后的重试退避
 KEEPALIVE_AFTER_SECONDS = 6 * 24 * 60 * 60   # 6 天没启动就保活一次
 KEEPALIVE_RUNTIME_SECONDS = 5 * 60           # 保活启动后运行 5 分钟再关
+KEEPALIVE_RETRY_SECONDS = 30 * 60            # 失败或状态不明时至少等 30 分钟
 
 
 # ============================================================
@@ -62,6 +63,7 @@ _ready_watchers: dict[str, asyncio.Task] = {}
 
 # 正在执行 6 天保活启动/关停的任务 {server_name: Task}
 _keepalive_tasks: dict[str, asyncio.Task] = {}
+_keepalive_retry_after: dict[str, float] = {}
 
 # 全局暂停截止时间戳；time() < _pause_until 时跳过所有检查
 _pause_until: float = 0.0
@@ -225,6 +227,7 @@ def start_watcher() -> asyncio.Task:
 
 def mark_opened(server_name: str) -> None:
     """记录服务器刚被开起来——启动 grace period，清空空闲计时"""
+    cancel_keepalive(server_name)
     now = time()
     _open_at[server_name] = now
     _last_active[server_name] = now  # 假设刚开还在活跃
@@ -239,6 +242,7 @@ def mark_opened(server_name: str) -> None:
 
 def mark_closed(server_name: str) -> None:
     """记录服务器被关——清空相关状态"""
+    cancel_keepalive(server_name)
     _stop_ws(server_name)               # 停掉实时控制台
     _flush_sessions(server_name)        # 结算在线时长
     _open_at.pop(server_name, None)
@@ -258,6 +262,26 @@ def cancel_pending(server_name: str) -> bool:
     """取消某个服务器的等待关停任务。返回 True=取消了，False=本来就没"""
     task = _pending_close.pop(server_name, None)
     if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
+
+def cancel_keepalive(server_name: str) -> bool:
+    """手动接管服务器时取消保活；保活自己的状态钩子不能取消自身。"""
+    task = _keepalive_tasks.get(server_name)
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:  # 同步状态钩子也允许在事件循环之外调用
+        current = None
+    if task is not None and task is current:
+        return False
+    # 同时阻止正在查询状态、还未来得及登记 task 的那一轮保活。
+    _keepalive_retry_after[server_name] = time() + KEEPALIVE_RETRY_SECONDS
+    if task is None:
+        return False
+    _keepalive_tasks.pop(server_name, None)
+    if task.done():
         return False
     task.cancel()
     return True
@@ -454,6 +478,14 @@ async def _tick() -> None:
             logger.exception(f"[keepalive] 检查 {s.name} 保活时出错")
 
 
+def _shares_timing_card(s: servers.Server) -> bool:
+    """同一张计时卡可能关联多个实例，自动关卡不能只依据其中一个实例。"""
+    return bool(s.card_id) and any(
+        other.name != s.name and other.card_id == s.card_id
+        for other in servers.list_servers()
+    )
+
+
 async def _check_keepalive(s: servers.Server) -> None:
     """6 天未启动的服务器自动短暂启动一次，避免服务商回收。"""
     if _start_callback is None or _close_callback is None:
@@ -466,12 +498,34 @@ async def _check_keepalive(s: servers.Server) -> None:
         return
 
     now = time()
+    if now < _keepalive_retry_after.get(s.name, 0):
+        return
+
+    # 关计时卡会影响所有绑定该卡的实例，不能让单台服务器的保活决定整张卡关停。
+    if _shares_timing_card(s):
+        _keepalive_retry_after[s.name] = now + KEEPALIVE_RETRY_SECONDS
+        logger.warning(f"[keepalive] {s.name} 与其他服务器共用计时卡，跳过自动保活")
+        return
+
     last_started = getattr(s, "last_started_at", 0) or s.created_at or s.updated_at or now
     age = now - last_started
     if age < KEEPALIVE_AFTER_SECONDS:
         return
 
-    if await _looks_running(s):
+    try:
+        running = await _looks_running(s)
+    except Exception as exc:
+        logger.warning(
+            f"[keepalive] 查询 {s.name} 状态异常: {type(exc).__name__}"
+        )
+        running = None
+    if time() < _keepalive_retry_after.get(s.name, 0):
+        return
+    if running is None:
+        _keepalive_retry_after[s.name] = now + KEEPALIVE_RETRY_SECONDS
+        logger.warning(f"[keepalive] 无法确认 {s.name} 已离线，暂缓保活")
+        return
+    if running:
         servers.mark_server_started(s.name)
         logger.info(f"[keepalive] {s.name} 当前已经在运行，仅刷新 last_started_at")
         return
@@ -483,24 +537,32 @@ async def _check_keepalive(s: servers.Server) -> None:
     )
 
 
-async def _looks_running(s: servers.Server) -> bool:
-    """尽量确认服务器是否已经在运行，避免保活流程误关正在运行的服务器。"""
+async def _looks_running(s: servers.Server) -> bool | None:
+    """True=运行，False=明确离线，None=状态未知；未知时禁止保活开机计费。"""
     if _can_panel(s):
         async def _res(panel):
             return await panel.get_resources(s.instance_uuid)
 
         data, err = await _panel_runner(s, _res)  # type: ignore[misc]
         if isinstance(data, dict):
-            state = data.get("attributes", {}).get("current_state")
-            return state in {"running", "starting"}
+            attributes = data.get("attributes")
+            if not isinstance(attributes, dict):
+                return None
+            state = attributes.get("current_state")
+            if state in {"running", "starting"}:
+                return True
+            if state == "offline":
+                return False
+            return None
         if err != "ok":
             logger.warning(f"[keepalive] 查询 {s.name} 面板状态失败: {err}")
-            return False
+            return None
 
     if s.address:
         status = await query_status(s.address, use_backoff=True)
-        return bool(status and status.online > 0)
-    return False
+        # SLP 有响应就说明服务器在运行，在线玩家为 0 不等于关机。
+        return True if status is not None else None
+    return None
 
 
 async def _keepalive_cycle(server_name: str, age_days: int) -> None:
@@ -518,8 +580,13 @@ async def _keepalive_cycle(server_name: str, age_days: int) -> None:
 
         ok, msg = await _start_callback(fresh)  # type: ignore[misc]
         if not ok:
-            await _broadcast(f"❌ 『{server_name}』保活开机失败：{msg}")
+            _keepalive_retry_after[server_name] = time() + KEEPALIVE_RETRY_SECONDS
+            await _broadcast(
+                f"❌ 『{server_name}』保活开机失败：{msg}\n"
+                "自动保活已暂停，至少 30 分钟后再尝试。"
+            )
             return
+        _keepalive_retry_after.pop(server_name, None)
         await _broadcast(f"✅ 『{server_name}』保活开机成功：{msg}")
 
         await asyncio.sleep(KEEPALIVE_RUNTIME_SECONDS)
@@ -538,14 +605,19 @@ async def _keepalive_cycle(server_name: str, age_days: int) -> None:
         logger.info(f"[keepalive] {server_name} 保活任务被取消")
         raise
     except Exception as e:
+        _keepalive_retry_after[server_name] = time() + KEEPALIVE_RETRY_SECONDS
         logger.exception(f"[keepalive] {server_name} 保活任务异常")
         await _broadcast(f"❌ 『{server_name}』保活任务异常：{type(e).__name__}: {e}")
     finally:
-        _keepalive_tasks.pop(server_name, None)
+        # 被手动取消后可能已有新任务，旧任务退出不能删除新的登记。
+        if _keepalive_tasks.get(server_name) is asyncio.current_task():
+            _keepalive_tasks.pop(server_name, None)
 
 
 async def _check_idle(s: servers.Server, status: "SlpStatus | None") -> None:
     """空闲检查;复用调用方已查好的 status,避免重复 SLP。"""
+    if _shares_timing_card(s):
+        return
     now = time()
     open_at = _open_at.get(s.name, now)
     if now - open_at < GRACE_PERIOD_SECONDS:

@@ -216,3 +216,59 @@ async def test_panel_client_keeps_session_fallback():
 def test_panel_client_requires_one_auth_method():
     with pytest.raises(ValueError):
         PanelClient()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, expected", [
+    (httpx.ConnectTimeout, "无法连接"),
+    (httpx.ReadTimeout, "操作结果尚未确认"),
+    (httpx.WriteTimeout, "操作结果尚未确认"),
+])
+async def test_timing_timeout_is_clear_and_never_replays_post(error, expected):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise error("internal detail", request=request)
+
+    client = make_client_with_mock(handler)
+    try:
+        with pytest.raises(APIError, match=expected) as exc:
+            await client.open_timing_only("private-card-id")
+        assert len(calls) == 1
+        assert "private-card-id" not in str(exc.value)
+        assert "internal detail" not in str(exc.value)
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("panel", [False, True])
+@pytest.mark.parametrize("body", ["<html>Verification</html>", "[]", "null"])
+async def test_non_api_response_never_claims_power_success(panel, body):
+    def handler(request):
+        return httpx.Response(200, text=body)
+
+    client = (
+        make_panel_client_with_mock(handler, api_key="test-key")
+        if panel else make_client_with_mock(handler)
+    )
+    try:
+        with pytest.raises(APIError, match="未确认操作成功"):
+            if panel:
+                await client.start_instance("server-id")
+            else:
+                await client.start_timing("card-id")
+    finally:
+        await client._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_panel_accepts_empty_204_power_success():
+    client = make_panel_client_with_mock(
+        lambda request: httpx.Response(204), api_key="test-key",
+    )
+    try:
+        await client.start_instance("server-id")
+    finally:
+        await client._http.aclose()

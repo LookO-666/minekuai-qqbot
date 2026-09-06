@@ -243,8 +243,28 @@ def list_servers() -> list[Server]:
     return [_server_from_row(r) for r in rows]
 
 
+def _resolve_server_name(conn: sqlite3.Connection, name: str) -> str | None:
+    """Prefer exact names; a case-insensitive fallback must identify one server."""
+    row = conn.execute(
+        "SELECT name FROM servers WHERE name = ?", (name,),
+    ).fetchone()
+    if row:
+        return row[0]
+    # SQLite NOCASE only handles ASCII, so use Python's Unicode case folding.
+    folded = name.casefold()
+    matches = [
+        existing for (existing,) in conn.execute("SELECT name FROM servers")
+        if existing.casefold() == folded
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def get_server(name: str) -> Server | None:
+    """Look up an exact name or its unique case-insensitive equivalent."""
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return None
         row = conn.execute(
             f"SELECT {_SERVER_COLS} FROM servers WHERE name = ?",
             (name,),
@@ -283,6 +303,9 @@ def add_server(
 def update_instance_uuid(name: str, instance_uuid: str) -> bool:
     now = int(time())
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
         cur = conn.execute(
             "UPDATE servers SET instance_uuid = ?, updated_at = ? WHERE name = ?",
             (instance_uuid, now, name),
@@ -295,6 +318,9 @@ def update_auto_close(name: str, idle_minutes: int) -> bool:
     """设置自动关停的空闲分钟数。0 = 关闭自动关停。"""
     now = int(time())
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
         cur = conn.execute(
             "UPDATE servers SET auto_close_idle_minutes = ?, updated_at = ? "
             "WHERE name = ?",
@@ -308,6 +334,9 @@ def mark_server_started(name: str, ts: int | None = None) -> bool:
     """记录服务器最近一次成功启动时间。"""
     now = int(time()) if ts is None else int(ts)
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
         cur = conn.execute(
             "UPDATE servers SET last_started_at = ?, updated_at = ? "
             "WHERE name = ?",
@@ -321,6 +350,9 @@ def bind_server_account(name: str, account_phone: str) -> bool:
     """把服务器绑定到某个账号（'' 解绑）。成功 True，服务器不存在 False。"""
     now = int(time())
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
         cur = conn.execute(
             "UPDATE servers SET account_phone = ?, updated_at = ? WHERE name = ?",
             (account_phone, now, name),
@@ -430,6 +462,9 @@ def mark_account_refreshed(phone: str) -> None:
 def remove_server(name: str) -> bool:
     """删除成功返回 True，名字不存在返回 False"""
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
         cur = conn.execute("DELETE FROM servers WHERE name = ?", (name,))
         conn.commit()
     return cur.rowcount > 0
@@ -438,6 +473,9 @@ def remove_server(name: str) -> bool:
 def update_token(name: str, token: str) -> bool:
     now = int(time())
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
         cur = conn.execute(
             "UPDATE servers SET token = ?, updated_at = ? WHERE name = ?",
             (encrypt_secret(token), now, name),
@@ -452,16 +490,19 @@ def update_credentials(name: str, token: str, client_id: str = "") -> bool:
     用于自动登录刷新后写回 DB——Chromium 登录拿到的 clientid 可能跟原来不同。
     """
     now = int(time())
-    if client_id:
-        sql = (
-            "UPDATE servers SET token = ?, client_id = ?, updated_at = ? "
-            "WHERE name = ?"
-        )
-        params = (encrypt_secret(token), client_id, now, name)
-    else:
-        sql = "UPDATE servers SET token = ?, updated_at = ? WHERE name = ?"
-        params = (encrypt_secret(token), now, name)
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
+        if client_id:
+            sql = (
+                "UPDATE servers SET token = ?, client_id = ?, updated_at = ? "
+                "WHERE name = ?"
+            )
+            params = (encrypt_secret(token), client_id, now, name)
+        else:
+            sql = "UPDATE servers SET token = ?, updated_at = ? WHERE name = ?"
+            params = (encrypt_secret(token), now, name)
         cur = conn.execute(sql, params)
         conn.commit()
     return cur.rowcount > 0
@@ -470,6 +511,9 @@ def update_credentials(name: str, token: str, client_id: str = "") -> bool:
 def update_address(name: str, address: str) -> bool:
     now = int(time())
     with closing(_connect()) as conn:
+        name = _resolve_server_name(conn, name)
+        if name is None:
+            return False
         cur = conn.execute(
             "UPDATE servers SET address = ?, updated_at = ? WHERE name = ?",
             (address, now, name),
@@ -483,6 +527,9 @@ def rename_server(old_name: str, new_name: str) -> bool:
     now = int(time())
     try:
         with closing(_connect()) as conn:
+            old_name = _resolve_server_name(conn, old_name)
+            if old_name is None:
+                return False
             cur = conn.execute(
                 "UPDATE servers SET name = ?, updated_at = ? WHERE name = ?",
                 (new_name, now, old_name),

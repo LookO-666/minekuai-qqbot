@@ -39,6 +39,31 @@ class RateLimitError(MinekuaiError):
     实际状态大概率已经是请求想要的状态。"""
 
 
+def _timeout_message(error: httpx.TimeoutException, service: str) -> str:
+    if isinstance(error, httpx.ConnectTimeout):
+        return f"无法连接{service}（连接超时），请检查机器人服务器网络或接口可用性"
+    if isinstance(error, httpx.PoolTimeout):
+        return f"{service}连接繁忙，请稍后重试"
+    return (
+        f"等待{service}响应超时，操作结果尚未确认；"
+        "请先在网页确认状态，勿连续重复开关"
+    )
+
+
+def _json_response(response: httpx.Response, service: str, *, allow_empty: bool = False) -> dict:
+    if allow_empty and response.status_code == 204 and not response.content:
+        return {}
+    try:
+        data = response.json()
+    except ValueError:
+        raise APIError(
+            f"{service}返回了网页或无效响应，可能遇到网站安全验证；未确认操作成功"
+        ) from None
+    if not isinstance(data, dict):
+        raise APIError(f"{service}响应格式异常；未确认操作成功")
+    return data
+
+
 class MinekuaiClient:
     """麦块联机计时卡 API 客户端（异步）"""
 
@@ -96,7 +121,7 @@ class MinekuaiClient:
         try:
             r = await self._http.request(method, path, **kwargs)
         except httpx.TimeoutException as e:
-            raise APIError(f"请求超时: {path}") from e
+            raise APIError(_timeout_message(e, "计时卡 API（api.minekuai.com）")) from e
         except httpx.HTTPError as e:
             raise APIError(f"网络错误: {e}") from e
 
@@ -106,10 +131,7 @@ class MinekuaiClient:
         if r.status_code >= 400:
             raise APIError(f"HTTP {r.status_code}: {r.text[:200]}")
 
-        try:
-            data = r.json()
-        except ValueError:
-            return {"raw": r.text}
+        data = _json_response(r, "计时卡 API")
 
         if isinstance(data, dict) and "code" in data:
             code = data.get("code")
@@ -239,7 +261,7 @@ class PanelClient:
         try:
             r = await self._http.request(method, path, **kwargs)
         except httpx.TimeoutException as e:
-            raise APIError(f"面板请求超时: {path}") from e
+            raise APIError(_timeout_message(e, "面板 API（minekuai.com）")) from e
         except httpx.HTTPError as e:
             raise APIError(f"面板网络错误: {e}") from e
 
@@ -252,10 +274,7 @@ class PanelClient:
         if r.status_code >= 400:
             raise APIError(f"面板 HTTP {r.status_code}: {r.text[:200]}")
 
-        try:
-            data = r.json()
-        except ValueError:
-            return {"raw": r.text}
+        data = _json_response(r, "面板 API", allow_empty=True)
 
         if isinstance(data, dict) and "code" in data:
             code = data.get("code")

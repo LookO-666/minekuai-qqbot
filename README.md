@@ -112,11 +112,13 @@ The command names are Chinese because the bot is designed for Chinese QQ groups;
 | Playtime and death statistics | Maintains player sessions from server logs, persists them in SQLite, and settles sessions when a server stops or becomes unreachable. |
 | Two-way chat bridge | Parses standard chat logs for MC → QQ. QQ → MC uses `tellraw` and only targets servers with confirmed online players. |
 | Idle shutdown | Includes a five-minute grace period after start. When the configured idle period is reached, broadcasts a cancellable 60-second countdown. |
-| Automatic keepalive | If a fully configured server has not started for about six days, starts it, keeps it running for about five minutes, then stops it, announcing each stage. |
+| Automatic keepalive | For a fully configured server not started for about six days, confirms it is offline before starting a five-minute keepalive cycle. Failures or unknown state defer another attempt for at least 30 minutes. |
 | Resource alerts | Requires CPU or memory to remain above its threshold for several checks before alerting; repeat alerts are rate-limited and mention administrators. |
 | SLP failure backoff | Background probes back off for 30, 60, 120, then 300 seconds after repeated failures. An explicit `在线` query still runs immediately. |
 | Credential recovery | Automatically signs in to renew an expired JWT. Refreshes a compatibility panel session once after a 401/419. Reports a revoked Client API Key explicitly. |
 | Update announcement | If the operator creates `bot-data/.changelog_to_send`, the bot sends its contents once after connecting and then removes the file. |
+
+Servers sharing one time card skip automatic keepalive and idle shutdown to avoid stopping another instance. Manual power operations on the same card cannot overlap; a manual operation cancels a pending keepalive shutdown. Server names accept a unique case-insensitive match (`atm` → `ATM`); ambiguous matches require the exact spelling.
 
 > Complete MC → QQ event and chat support requires an instance UUID, a linked account, and access to a standard-format `latest.log`. Modpacks or chat plugins that rewrite log lines may require additional regular expressions.
 
@@ -477,7 +479,11 @@ Use `服务器列表` to inspect the current configuration.
 
 **The bot says the operation is too frequent.**
 
-The time card was just started or stopped and the backend is rate-limiting requests. The bot recognizes this state and reports it with ℹ️ rather than ❌ because the desired state has already been reached.
+The backend is rate-limiting requests. This does not confirm whether the requested state was reached. Check the website before repeating a power operation.
+
+**The time-card API times out, or an API returns a website verification page.**
+
+A connection timeout to `api.minekuai.com` means the bot could not connect, not that the password is wrong. Check connectivity from the bot host. A response timeout leaves the operation's result unknown; the bot does not replay power requests automatically. HTML/security challenge pages are rejected rather than reported as successful API calls. A panel Client API Key does not replace time-card API access.
 
 **The image builds slowly.**
 

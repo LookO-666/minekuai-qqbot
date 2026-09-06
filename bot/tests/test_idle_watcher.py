@@ -1,8 +1,10 @@
 """idle_watcher.py 的 SLP 退避单元测试。"""
 import importlib.util
+import asyncio
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -114,3 +116,205 @@ async def test_resource_alert_mentions_admins_not_all_allowed_users(
     )
 
     assert sent == ["CPU alert [CQ:at,qq=222]"]
+
+
+def _keepalive_server(name="ATM", card_id="shared-card"):
+    return types.SimpleNamespace(
+        name=name,
+        card_id=card_id,
+        instance_uuid="instance-uuid",
+        account_phone="test-account",
+        address="mc.example.com:25565",
+        last_started_at=1_000_000,
+        created_at=1_000_000,
+        updated_at=1_000_000,
+    )
+
+
+def _configure_keepalive(module, monkeypatch, server):
+    monkeypatch.setattr(module.servers, "list_servers", lambda: [server], raising=False)
+    monkeypatch.setattr(module.servers, "get_server", lambda _name: server, raising=False)
+    module._start_callback = AsyncMock(return_value=(False, "request timed out"))
+    module._close_callback = AsyncMock(return_value=(True, "ok"))
+    monkeypatch.setattr(module, "_broadcast", AsyncMock())
+    monkeypatch.setattr(module, "_looks_running", AsyncMock(return_value=False))
+
+
+@pytest.mark.asyncio
+async def test_failed_keepalive_waits_thirty_minutes_before_retry(
+    idle_watcher_mod, monkeypatch,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    _configure_keepalive(module, monkeypatch, server)
+    now = [4_000_000.0]
+    monkeypatch.setattr(module, "time", lambda: now[0])
+
+    await module._check_keepalive(server)
+    await module._keepalive_tasks[server.name]
+    assert module._start_callback.await_count == 1
+    assert module._broadcast.await_count == 2
+    assert module._keepalive_retry_after[server.name] >= now[0] + 30 * 60
+    assert server.name not in module._keepalive_tasks
+
+    now[0] += 60
+    await module._check_keepalive(server)
+    assert module._start_callback.await_count == 1
+    assert module._broadcast.await_count == 2
+
+    now[0] += 30 * 60
+    await module._check_keepalive(server)
+    await module._keepalive_tasks[server.name]
+    assert module._start_callback.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_card_never_starts_automatic_keepalive(
+    idle_watcher_mod, monkeypatch,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    other = _keepalive_server(name="bingo")
+    _configure_keepalive(module, monkeypatch, server)
+    monkeypatch.setattr(module.servers, "list_servers", lambda: [server, other])
+    monkeypatch.setattr(module, "time", lambda: 4_000_000.0)
+
+    await module._check_keepalive(server)
+    await module._check_keepalive(other)
+    module._looks_running.assert_not_awaited()
+    module._start_callback.assert_not_awaited()
+    module._broadcast.assert_not_awaited()
+    assert module._keepalive_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_shared_card_does_not_schedule_idle_shutdown(
+    idle_watcher_mod, monkeypatch,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    server.auto_close_idle_minutes = 1
+    other = _keepalive_server(name="bingo")
+    monkeypatch.setattr(
+        module.servers, "list_servers", lambda: [server, other], raising=False
+    )
+    monkeypatch.setattr(module, "time", lambda: 4_000_000.0)
+    module._open_at[server.name] = 1_000_000.0
+    module._last_active[server.name] = 1_000_000.0
+    try:
+        await module._check_idle(server, types.SimpleNamespace(online=0))
+        assert module._pending_close == {}
+    finally:
+        for task in module._pending_close.values():
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_defers_keepalive_without_starting(
+    idle_watcher_mod, monkeypatch,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    _configure_keepalive(module, monkeypatch, server)
+    module._looks_running.return_value = None
+    monkeypatch.setattr(module, "time", lambda: 4_000_000.0)
+
+    await module._check_keepalive(server)
+    await module._check_keepalive(server)
+    assert module._looks_running.await_count == 1
+    module._start_callback.assert_not_awaited()
+    module._broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("data", "err", "expected"),
+    [
+        ({"attributes": {"current_state": "running"}}, "ok", True),
+        ({"attributes": {"current_state": "starting"}}, "ok", True),
+        ({"attributes": {"current_state": "offline"}}, "ok", False),
+        ({"attributes": {"current_state": "stopping"}}, "ok", None),
+        ({"attributes": None}, "ok", None),
+        ({"raw": "Verification"}, "ok", None),
+        (None, "request timed out", None),
+    ],
+)
+async def test_keepalive_requires_explicit_offline_state(
+    idle_watcher_mod, monkeypatch, data, err, expected,
+):
+    module = idle_watcher_mod
+    module._config = types.SimpleNamespace()
+    module._panel_runner = AsyncMock(return_value=(data, err))
+    monkeypatch.setattr(module, "query_status", AsyncMock(return_value=None))
+
+    assert await module._looks_running(_keepalive_server()) is expected
+    module.query_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reachable", [True, False])
+async def test_empty_server_is_running_and_unreachable_is_unknown(
+    idle_watcher_mod, monkeypatch, reachable,
+):
+    module = idle_watcher_mod
+    status = types.SimpleNamespace(online=0) if reachable else None
+    monkeypatch.setattr(module, "query_status", AsyncMock(return_value=status))
+
+    assert await module._looks_running(_keepalive_server()) is (
+        True if reachable else None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook", ["mark_opened", "mark_closed"])
+async def test_manual_state_change_cancels_keepalive(idle_watcher_mod, hook):
+    module = idle_watcher_mod
+    task = asyncio.create_task(asyncio.Event().wait())
+    module._keepalive_tasks["ATM"] = task
+
+    getattr(module, hook)("ATM")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert "ATM" not in module._keepalive_tasks
+    assert module._keepalive_retry_after["ATM"] > module.time()
+
+
+@pytest.mark.asyncio
+async def test_keepalive_state_hooks_do_not_cancel_their_own_task(idle_watcher_mod):
+    module = idle_watcher_mod
+    current = asyncio.current_task()
+    module._keepalive_tasks["ATM"] = current
+    try:
+        module.mark_opened("ATM")
+        module.mark_closed("ATM")
+        assert module._keepalive_tasks["ATM"] is current
+        assert "ATM" not in module._keepalive_retry_after
+        assert not current.cancelling()
+    finally:
+        module._keepalive_tasks.pop("ATM", None)
+
+
+@pytest.mark.asyncio
+async def test_manual_takeover_during_status_probe_prevents_keepalive(
+    idle_watcher_mod, monkeypatch,
+):
+    module = idle_watcher_mod
+    server = _keepalive_server()
+    _configure_keepalive(module, monkeypatch, server)
+    monkeypatch.setattr(module, "time", lambda: 4_000_000.0)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def probe(_server):
+        entered.set()
+        await release.wait()
+        return False
+
+    monkeypatch.setattr(module, "_looks_running", probe)
+    check = asyncio.create_task(module._check_keepalive(server))
+    await entered.wait()
+    assert module.cancel_keepalive(server.name) is False
+    release.set()
+    await check
+    module._start_callback.assert_not_awaited()
+    assert module._keepalive_tasks == {}

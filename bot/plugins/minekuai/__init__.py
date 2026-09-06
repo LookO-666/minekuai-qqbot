@@ -86,6 +86,7 @@ from .client import (
     RateLimitError,
 )
 from .config import Config
+from .operations import OperationBusyError, card_operation
 from .permission import (
     check_cooldown,
     consume_pending_confirm,
@@ -177,6 +178,16 @@ async def _maybe_send_changelog(bot: Bot) -> None:
 
 async def _auto_close_callback(server: servers.Server) -> tuple[bool, str]:
     """被 idle_watcher 调用执行实际关停。返回 (成功?, 状态消息)"""
+    if any(s.name != server.name and s.card_id == server.card_id for s in servers.list_servers()):
+        return False, "多台服务器共用计时卡，已跳过自动关机，请确认后手动关服"
+    try:
+        async with card_operation(server.card_id):
+            return await _auto_close_locked(server)
+    except OperationBusyError as e:
+        return False, str(e)
+
+
+async def _auto_close_locked(server: servers.Server) -> tuple[bool, str]:
     try:
         async with _build_client(server) as client:
             await client.close_server(card_id=server.card_id)
@@ -211,6 +222,14 @@ async def _auto_close_callback(server: servers.Server) -> tuple[bool, str]:
 
 async def _auto_start_callback(server: servers.Server) -> tuple[bool, str]:
     """被 idle_watcher 调用执行保活启动。返回 (成功?, 状态消息)。"""
+    try:
+        async with card_operation(server.card_id):
+            return await _auto_start_locked(server)
+    except OperationBusyError as e:
+        return False, str(e)
+
+
+async def _auto_start_locked(server: servers.Server) -> tuple[bool, str]:
     try:
         if (not server.token or not server.client_id) and server.account_phone:
             ok, msg = await _refresh_token_for(server)
@@ -276,13 +295,11 @@ async def _auto_start_callback(server: servers.Server) -> tuple[bool, str]:
         return True, f"计时卡已开启{instance_msg}"
 
     except RateLimitError as e:
-        servers.mark_server_started(server.name)
-        idle_watcher.mark_opened(server.name)
         log_operation(
             0, "keepalive", None,
-            f"keepalive_start {server.name}", True, f"限流: {e}",
+            f"keepalive_start {server.name}", False, f"限流: {e}",
         )
-        return True, f"计时卡可能已开启（{e}）"
+        return False, f"请求被限流，未确认启动成功，不执行保活自动关机（{e}）"
     except AuthError as e:
         log_operation(
             0, "keepalive", None,
@@ -612,7 +629,7 @@ async def _start_instance(
             continue
 
         except RateLimitError as e:
-            return True, f"实例可能已在启动（{e}）"
+            return False, f"实例请求被限流，未确认启动成功（{e}）"
 
         except MinekuaiError as e:
             return False, str(e)
@@ -686,6 +703,17 @@ async def _start_step(
             f"找不到服务器『{name}』。请重输或发『取消』。"
         )
 
+    try:
+        async with card_operation(server.card_id):
+            idle_watcher.cancel_keepalive(server.name)
+            await _start_server_locked(matcher, event, server)
+    except OperationBusyError as e:
+        await matcher.finish(str(e))
+
+
+async def _start_server_locked(
+    matcher: Matcher, event: MessageEvent, server: servers.Server,
+):
     user_id = event.user_id
     group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
     user_name = _user_display_name(event)
@@ -807,7 +835,7 @@ async def _start_step(
             update_cooldown(user_id, "start")
             log_operation(
                 user_id, user_name, group_id,
-                f"start {server.name}", True, f"限流: {e}",
+                f"start {server.name}", False, f"状态未确认，限流: {e}",
             )
             await matcher.finish(
                 f"ℹ️ 『{server.name}』计时卡可能已开启（操作太频繁）。\n"
@@ -899,10 +927,19 @@ async def _stop_step(
     user_id = event.user_id
     user_name = _user_display_name(event)
 
-    if config.stop_need_confirm:
+    shared_names = [
+        s.name for s in servers.list_servers()
+        if s.name != server.name and s.card_id == server.card_id
+    ]
+    shared_warning = (
+        f"同一计时卡还关联：{'、'.join(shared_names)}，关闭也可能影响它们！\n"
+        if shared_names else ""
+    )
+    if config.stop_need_confirm or shared_names:
         mark_pending_confirm(user_id, server.name)
         await matcher.finish(
             f"⚠️ 关闭『{server.name}』会断开所有玩家！\n"
+            f"{shared_warning}"
             f"如确认关服，请在 5 分钟内回复：确认关服"
         )
 
@@ -914,6 +951,17 @@ async def _do_stop(
     event: MessageEvent,
     user_name: str,
     server: servers.Server,
+):
+    try:
+        async with card_operation(server.card_id):
+            idle_watcher.cancel_keepalive(server.name)
+            await _stop_server_locked(matcher, event, user_name, server)
+    except OperationBusyError as e:
+        await matcher.finish(str(e))
+
+
+async def _stop_server_locked(
+    matcher: Matcher, event: MessageEvent, user_name: str, server: servers.Server,
 ):
     user_id = event.user_id
     group_id = event.group_id if isinstance(event, GroupMessageEvent) else None
@@ -970,7 +1018,7 @@ async def _do_stop(
             update_cooldown(user_id, "stop")
             log_operation(
                 user_id, user_name, group_id,
-                f"stop {server.name}", True, f"限流: {e}",
+                f"stop {server.name}", False, f"状态未确认，限流: {e}",
             )
             await matcher.finish(
                 f"ℹ️ 『{server.name}』计时卡可能已关闭（操作太频繁）"

@@ -43,6 +43,86 @@ def test_add_and_get_server(servers_mod):
     assert s.account_phone == ""     # 默认空
 
 
+@pytest.mark.parametrize("name", ["ATM", "atm", "AtM"])
+def test_get_server_accepts_case_variants(servers_mod, name):
+    servers_mod.add_server("ATM", "1", "t", "c")
+    assert servers_mod.get_server(name).name == "ATM"
+
+
+def test_get_server_supports_unicode_casefold(servers_mod):
+    servers_mod.add_server("Straße", "1", "t", "c")
+    assert servers_mod.get_server("STRASSE").name == "Straße"
+
+
+def test_get_server_exact_match_precedes_casefold(servers_mod):
+    servers_mod.add_server("ATM", "1", "t", "c")
+    servers_mod.add_server("Atm", "2", "t", "c")
+    assert servers_mod.get_server("ATM").card_id == "1"
+    assert servers_mod.get_server("Atm").card_id == "2"
+    assert servers_mod.get_server("atm") is None
+    assert servers_mod.get_server("missing") is None
+
+
+_SERVER_MUTATIONS = [
+    ("update_instance_uuid", ("new-uuid",), "instance_uuid", "new-uuid"),
+    ("update_auto_close", (15,), "auto_close_idle_minutes", 15),
+    ("mark_server_started", (123456,), "last_started_at", 123456),
+    ("bind_server_account", ("13900000000",), "account_phone", "13900000000"),
+    ("update_token", ("new-token",), "token", "new-token"),
+    ("update_credentials", ("new-token", "new-client"), "client_id", "new-client"),
+    ("update_credentials", ("new-token",), "token", "new-token"),
+    ("update_address", ("mc.example.com",), "address", "mc.example.com"),
+    ("rename_server", ("renamed",), "name", "renamed"),
+    ("remove_server", (), None, None),
+]
+
+
+@pytest.mark.parametrize("method,args,field,expected", _SERVER_MUTATIONS)
+def test_server_mutation_accepts_unique_case_variant(
+    servers_mod, method, args, field, expected,
+):
+    servers_mod.add_server("ATM", "1", "t", "c")
+    operation = getattr(servers_mod, method)
+    assert operation("atm", *args) is True
+    remaining = servers_mod.list_servers()
+    if field is None:
+        assert remaining == []
+    else:
+        assert len(remaining) == 1
+        assert getattr(remaining[0], field) == expected
+    assert operation("missing", *args) is False
+
+
+@pytest.mark.parametrize("method,args,field,expected", _SERVER_MUTATIONS)
+def test_server_mutation_refuses_ambiguous_case_variant(
+    servers_mod, method, args, field, expected,
+):
+    servers_mod.add_server("ATM", "1", "t", "c")
+    servers_mod.add_server("Atm", "2", "t", "c")
+    before = servers_mod.list_servers()
+    assert getattr(servers_mod, method)("atm", *args) is False
+    assert servers_mod.list_servers() == before
+
+
+@pytest.mark.parametrize("method,args,field,expected", _SERVER_MUTATIONS)
+def test_server_mutation_preserves_resolved_exact_target(
+    servers_mod, method, args, field, expected,
+):
+    servers_mod.add_server("ATM", "1", "t", "c")
+    resolved = servers_mod.get_server("atm")
+    # A differently-cased server added after lookup must not steal the write.
+    servers_mod.add_server("Atm", "2", "other-token", "other-client")
+    other_before = servers_mod.get_server("Atm")
+    assert getattr(servers_mod, method)(resolved.name, *args) is True
+    assert servers_mod.get_server("Atm") == other_before
+    target = next((s for s in servers_mod.list_servers() if s.card_id == "1"), None)
+    if field is None:
+        assert target is None
+    else:
+        assert target is not None
+        assert getattr(target, field) == expected
+
+
 def test_add_server_with_address_and_account(servers_mod):
     servers_mod.add_account("13900000000", "pw")
     servers_mod.add_server(
